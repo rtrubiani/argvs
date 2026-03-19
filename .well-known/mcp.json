@@ -1,0 +1,87 @@
+{
+  "name": "Argvs",
+  "description": "Instant sanctions screening API for AI agents. Screens names against OFAC SDN, OFAC Consolidated, EU, UN, and UK HMT sanctions lists using fuzzy matching.",
+  "url": "http://localhost:3000",
+  "tools": [
+    {
+      "name": "screen_sanctions",
+      "description": "Screen a single name against all international sanctions lists (OFAC, EU, UN, UK). Returns match confidence, risk level, and matched list details. Costs $0.03 per screen via MPP/Tempo.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The person or entity name to screen"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["individual", "entity", "vessel", "aircraft"],
+            "description": "Optional entity type to boost matching accuracy"
+          },
+          "country": {
+            "type": "string",
+            "description": "Optional country to boost matching accuracy"
+          }
+        },
+        "required": ["name"]
+      },
+      "endpoint": {
+        "url": "/api/screen",
+        "method": "POST"
+      },
+      "payment": {
+        "method": "MPP",
+        "amount": "0.03",
+        "currency": "pathUSD"
+      }
+    },
+    {
+      "name": "batch_screen_sanctions",
+      "description": "Screen multiple names against all international sanctions lists in a single request. Max 100 entities. Costs $0.02 per entity via MPP/Tempo.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "entities": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "The person or entity name to screen"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": ["individual", "entity", "vessel", "aircraft"],
+                  "description": "Optional entity type"
+                },
+                "country": {
+                  "type": "string",
+                  "description": "Optional country"
+                }
+              },
+              "required": ["name"]
+            },
+            "description": "Array of entities to screen"
+          }
+        },
+        "required": ["entities"]
+      },
+      "endpoint": {
+        "url": "/api/batch",
+        "method": "POST"
+      },
+      "payment": {
+        "method": "MPP",
+        "amount_per_entity": "0.02",
+        "currency": "pathUSD"
+      }
+    }
+  ],
+  "payment": {
+    "methods": ["MPP/Tempo"],
+    "currency": "pathUSD",
+    "network": "Tempo"
+  }
+}

@@ -1,0 +1,92 @@
+# Argvs — Sanctions Screening API
+
+Argvs screens names against international sanctions lists (OFAC SDN, OFAC Consolidated, EU, UN, UK HMT) using fuzzy matching. Results include confidence scores, risk levels, and matched list details.
+
+## Quick Start
+
+Base URL: `http://localhost:3000`
+
+Payment: MPP/Tempo — pathUSD stablecoins on Tempo blockchain.
+
+## Endpoints
+
+### Screen a single name (paid, $0.03)
+
+```bash
+curl -X POST http://localhost:3000/api/screen \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Viktor Bout", "type": "individual"}'
+```
+
+### Batch screen (paid, $0.02/entity)
+
+```bash
+curl -X POST http://localhost:3000/api/batch \
+  -H "Content-Type: application/json" \
+  -d '{"entities": [{"name": "Viktor Bout"}, {"name": "Gazprombank"}]}'
+```
+
+### Check data status (free)
+
+```bash
+curl http://localhost:3000/api/status
+```
+
+### Service discovery (free)
+
+```bash
+curl http://localhost:3000/api
+```
+
+## Using with mppx CLI
+
+Agents can pay for screens using the mppx CLI:
+
+```bash
+# Install mppx
+npm install -g mppx
+
+# Screen a name (mppx handles payment automatically)
+mppx fetch POST http://localhost:3000/api/screen \
+  --body '{"name": "Viktor Bout"}' \
+  --method tempo
+
+# Batch screen
+mppx fetch POST http://localhost:3000/api/batch \
+  --body '{"entities": [{"name": "Kim Jong Un"}, {"name": "Al-Rashid Trust"}]}' \
+  --method tempo
+```
+
+## MCP Tool Discovery
+
+Argvs serves `/.well-known/mcp.json` for automatic tool discovery by AI agents (Claude Code, Cursor, etc.). Point your MCP client at `http://localhost:3000` and it will discover the `screen_sanctions` and `batch_screen_sanctions` tools automatically.
+
+## Response Format
+
+```json
+{
+  "query": "Viktor Bout",
+  "screened_at": "2026-03-19T12:00:00.000Z",
+  "matches": [
+    {
+      "name": "BOUT Viktor Anatolijevitch",
+      "source": "ofac_sdn",
+      "type": "individual",
+      "programs": ["DRCONGO"],
+      "countries": [],
+      "confidence": 90,
+      "aliases_matched": []
+    }
+  ],
+  "risk_level": "match",
+  "lists_checked": ["ofac_sdn", "ofac_consolidated", "eu", "un", "uk_hmt"],
+  "total_entities_screened": 31145,
+  "disclaimer": "Automated screening tool. Results should be verified against official sources. Not legal or compliance advice."
+}
+```
+
+## Risk Levels
+
+- **match** (confidence >= 90): Strong match found. Verify against official sources.
+- **potential_match** (confidence 70-89): Possible match. Manual review recommended.
+- **clear** (confidence < 70): No significant matches found.

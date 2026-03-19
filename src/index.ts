@@ -19,6 +19,11 @@ import {
 import { notifyScreen, notifyBatch } from "./telegram.js";
 
 // ---------------------------------------------------------------------------
+// Runtime state
+// ---------------------------------------------------------------------------
+let dataReady = false;
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
@@ -120,6 +125,15 @@ app.get("/api", (c) =>
 );
 
 app.get("/api/status", (c) => {
+  if (!dataReady) {
+    return c.json({
+      state: "initializing",
+      message: "Data loading in progress",
+      matching_method: "FTS5 + Levenshtein + token overlap",
+      update_frequency: "daily",
+    });
+  }
+
   const db = getDb();
   const sources = db
     .prepare(
@@ -144,6 +158,7 @@ app.get("/api/status", (c) => {
   }
 
   return c.json({
+    state: "ready",
     lists,
     total_entities: total.count,
     matching_method: "FTS5 + Levenshtein + token overlap",
@@ -160,6 +175,26 @@ app.get("/.well-known/mcp.json", async (c) => {
 });
 
 // --- Paid endpoints -------------------------------------------------------
+
+// Block screening endpoints until data is loaded
+app.use("/api/screen", async (c, next) => {
+  if (!dataReady) {
+    return c.json(
+      { error: "Data loading in progress, try again shortly" },
+      503
+    );
+  }
+  return next();
+});
+app.use("/api/batch", async (c, next) => {
+  if (!dataReady) {
+    return c.json(
+      { error: "Data loading in progress, try again shortly" },
+      503
+    );
+  }
+  return next();
+});
 
 app.post(
   "/api/screen",
@@ -289,6 +324,7 @@ async function refreshData() {
         err instanceof Error ? err.message : err
       );
     }
+    dataReady = true;
     console.log(`[cron] Refresh complete. ${total} entities indexed.`);
   } catch (err) {
     console.error("[cron] Refresh failed:", err);
@@ -302,18 +338,27 @@ cron.schedule("0 6 * * *", refreshData, { timezone: "UTC" });
 // ---------------------------------------------------------------------------
 initDatabase();
 
-const totalEntities = (
-  getDb().prepare("SELECT COUNT(*) as count FROM entities").get() as {
-    count: number;
-  }
-).count;
-
-console.log(`Loaded ${totalEntities} entities`);
 if (TESTNET) console.log("⚠ TESTNET mode: payments disabled");
 
 // Initialize x402 (async, non-blocking — server starts immediately)
 initX402().catch(() => {});
 
-console.log(`Argvs running on port ${PORT}`);
+console.log(`Argvs running on port ${PORT} (data loading in background...)`);
 
 serve({ fetch: app.fetch, port: PORT });
+
+// Run initial data ingestion in the background after server starts
+(async () => {
+  try {
+    await refreshData();
+    dataReady = true;
+    const total = (
+      getDb().prepare("SELECT COUNT(*) as count FROM entities").get() as {
+        count: number;
+      }
+    ).count;
+    console.log(`[startup] Data ready. ${total} entities loaded.`);
+  } catch (err) {
+    console.error("[startup] Initial ingestion failed:", err);
+  }
+})();

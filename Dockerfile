@@ -13,9 +13,6 @@ COPY .well-known/ ./.well-known/
 COPY mcp/ ./mcp/
 RUN npx tsc
 
-# Ingest sanctions data during build
-RUN mkdir -p data && node dist/ingest/ingest.js
-
 # Remove dev deps for smaller image
 RUN npm prune --omit=dev
 

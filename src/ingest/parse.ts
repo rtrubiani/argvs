@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { createReadStream, readFileSync, statSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { join, dirname } from "node:path";
-import { XMLParser } from "fast-xml-parser";
+import sax from "sax";
 import type { DataSource } from "./sources.js";
 
 export interface SanctionEntity {
@@ -16,33 +17,68 @@ export interface SanctionEntity {
   remarks: string;
 }
 
-function toArray<T>(val: T | T[] | undefined | null): T[] {
-  if (val == null) return [];
-  return Array.isArray(val) ? val : [val];
-}
-
-function clean(val: unknown): string {
-  if (val == null) return "";
-  return String(val).trim();
-}
-
 export function tryGc(): void {
   if (typeof globalThis.gc === "function") {
     globalThis.gc();
   }
 }
 
-function makeXmlParser(): XMLParser {
-  return new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: "@_",
-    processEntities: false,
-  });
+export function logHeap(label: string): void {
+  const used = process.memoryUsage().heapUsed;
+  console.log(`[heap] ${label}: ${(used / 1024 / 1024).toFixed(1)} MB`);
+}
+
+export function getHeapMB(): number {
+  return process.memoryUsage().heapUsed / 1024 / 1024;
 }
 
 // ---------------------------------------------------------------------------
-// Shared CSV helper: determine OFAC entity type from SDN_Type field
+// CSV line parser
 // ---------------------------------------------------------------------------
+
+export function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        fields.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+// ---------------------------------------------------------------------------
+// Entity callback type — streaming parsers call this for each entity
+// ---------------------------------------------------------------------------
+
+export type EntityCallback = (entity: SanctionEntity) => void;
+
+// ---------------------------------------------------------------------------
+// OFAC entity type helper
+// ---------------------------------------------------------------------------
+
 function ofacEntityType(sdnType: string): SanctionEntity["type"] {
   const t = sdnType.toLowerCase().trim();
   if (t === "individual") return "individual";
@@ -53,25 +89,22 @@ function ofacEntityType(sdnType: string): SanctionEntity["type"] {
 }
 
 // ---------------------------------------------------------------------------
-// OFAC SDN CSV — line-by-line parsing of sdn.csv + alt.csv + add.csv
-//
-// sdn.csv columns (no header, positional):
-//   0: ent_num, 1: SDN_Name, 2: SDN_Type, 3: Program, 4: Title,
-//   5: Call_Sign, 6: Vess_type, 7: Tonnage, 8: GRT, 9: Vess_flag,
-//   10: Vess_owner, 11: Remarks
-//
-// alt.csv columns: ent_num, alt_num, alt_type, alt_name, alt_remarks
-// add.csv columns: ent_num, add_num, Address, City, Country, add_remarks
+// OFAC SDN CSV — stream line by line
 // ---------------------------------------------------------------------------
-function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
+
+async function streamOfacSdnCsv(
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
   const dataDir = dirname(filepath);
 
-  // Build alias lookup from alt.csv (ent_num → alias names)
+  // Build alias lookup from alt.csv (small file, ~3MB) — streamed
   const aliasMap = new Map<string, string[]>();
   try {
-    const altRaw = readFileSync(join(dataDir, "ofac_sdn_alt.csv"), "utf-8");
-    const altLines = altRaw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-    for (const line of altLines) {
+    const altPath = join(dataDir, "ofac_sdn_alt.csv");
+    const altStream = createReadStream(altPath, { encoding: "utf-8" });
+    const altRl = createInterface({ input: altStream, crlfDelay: Infinity });
+    for await (const line of altRl) {
       if (!line.trim()) continue;
       const fields = parseCsvLine(line);
       const entNum = fields[0]?.trim();
@@ -80,16 +113,17 @@ function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
       if (!aliasMap.has(entNum)) aliasMap.set(entNum, []);
       aliasMap.get(entNum)!.push(altName);
     }
-  } catch (err) {
+  } catch {
     console.warn("[parse] ofac_sdn: could not read alt.csv, continuing without aliases");
   }
 
-  // Build country lookup from add.csv (ent_num → countries)
+  // Build country lookup from add.csv (small file, ~4MB) — streamed
   const countryMap = new Map<string, string[]>();
   try {
-    const addRaw = readFileSync(join(dataDir, "ofac_sdn_add.csv"), "utf-8");
-    const addLines = addRaw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-    for (const line of addLines) {
+    const addPath = join(dataDir, "ofac_sdn_add.csv");
+    const addStream = createReadStream(addPath, { encoding: "utf-8" });
+    const addRl = createInterface({ input: addStream, crlfDelay: Infinity });
+    for await (const line of addRl) {
       if (!line.trim()) continue;
       const fields = parseCsvLine(line);
       const entNum = fields[0]?.trim();
@@ -98,19 +132,19 @@ function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
       if (!countryMap.has(entNum)) countryMap.set(entNum, []);
       countryMap.get(entNum)!.push(country);
     }
-  } catch (err) {
+  } catch {
     console.warn("[parse] ofac_sdn: could not read add.csv, continuing without countries");
   }
 
-  // Parse main sdn.csv line by line
-  const raw = readFileSync(filepath, "utf-8");
-  console.log(
-    `[parse] ofac_sdn: ${(raw.length / 1024 / 1024).toFixed(1)}MB CSV`
-  );
-  const lines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  // Stream main sdn.csv
+  const size = statSync(filepath).size;
+  console.log(`[parse] ofac_sdn: ${(size / 1024 / 1024).toFixed(1)}MB CSV`);
 
-  const results: SanctionEntity[] = [];
-  for (const line of lines) {
+  let count = 0;
+  const stream = createReadStream(filepath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
     if (!line.trim()) continue;
     const fields = parseCsvLine(line);
     const entNum = fields[0]?.trim();
@@ -130,7 +164,7 @@ function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
     const aliases = aliasMap.get(entNum) ?? [];
     const countries = [...new Set(countryMap.get(entNum) ?? [])];
 
-    results.push({
+    onEntity({
       id: `ofac_sdn:${entNum}`,
       source: "ofac_sdn",
       name,
@@ -142,29 +176,29 @@ function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
       date_listed: "",
       remarks: remarks === "-0-" ? "" : remarks,
     });
+    count++;
   }
 
-  console.log(`[parse] ofac_sdn: ${results.length} entities parsed`);
-  return results;
+  console.log(`[parse] ofac_sdn: ${count} entities parsed`);
+  return count;
 }
 
 // ---------------------------------------------------------------------------
-// OFAC Consolidated CSV — line-by-line parsing of cons_prim.csv
-//
-// Same column layout as sdn.csv (no header, positional):
-//   0: ent_num, 1: SDN_Name, 2: SDN_Type, 3: Program, 4: Title,
-//   5: Call_Sign, 6: Vess_type, 7: Tonnage, 8: GRT, 9: Vess_flag,
-//   10: Vess_owner, 11: Remarks
+// OFAC Consolidated CSV — stream line by line
 // ---------------------------------------------------------------------------
-function parseOfacConsolidatedCsv(filepath: string): SanctionEntity[] {
-  const raw = readFileSync(filepath, "utf-8");
-  console.log(
-    `[parse] ofac_consolidated: ${(raw.length / 1024 / 1024).toFixed(1)}MB CSV`
-  );
-  const lines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-  const results: SanctionEntity[] = [];
-  for (const line of lines) {
+async function streamOfacConsolidatedCsv(
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
+  const size = statSync(filepath).size;
+  console.log(`[parse] ofac_consolidated: ${(size / 1024 / 1024).toFixed(1)}MB CSV`);
+
+  let count = 0;
+  const stream = createReadStream(filepath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
     if (!line.trim()) continue;
     const fields = parseCsvLine(line);
     const entNum = fields[0]?.trim();
@@ -181,7 +215,7 @@ function parseOfacConsolidatedCsv(filepath: string): SanctionEntity[] {
       ? program.split(";").map((p) => p.trim()).filter(Boolean)
       : [];
 
-    results.push({
+    onEntity({
       id: `ofac_consolidated:${entNum}`,
       source: "ofac_consolidated",
       name,
@@ -193,190 +227,53 @@ function parseOfacConsolidatedCsv(filepath: string): SanctionEntity[] {
       date_listed: "",
       remarks: remarks === "-0-" ? "" : remarks,
     });
+    count++;
   }
 
-  console.log(`[parse] ofac_consolidated: ${results.length} entities parsed`);
-  return results;
+  console.log(`[parse] ofac_consolidated: ${count} entities parsed`);
+  return count;
 }
 
 // ---------------------------------------------------------------------------
-// EU Consolidated
+// UK HMT CSV — stream line by line, group by Group ID
 // ---------------------------------------------------------------------------
-function parseEuXml(filepath: string): SanctionEntity[] {
-  const xml = readFileSync(filepath, "utf-8");
-  const parser = makeXmlParser();
-  const doc = parser.parse(xml);
 
-  const entities = toArray(doc?.export?.sanctionEntity);
-  return entities.map((ent: any) => {
-    const nameAlias = toArray(ent.nameAlias);
-    const primaryName =
-      nameAlias.find(
-        (n: any) =>
-          clean(n["@_nameStatus"]) === "primary" ||
-          clean(n["@_strong"]) === "true"
-      ) || nameAlias[0];
-    const name = clean(primaryName?.["@_wholeName"]);
+async function streamUkCsv(
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
+  const size = statSync(filepath).size;
+  console.log(`[parse] uk_hmt: ${(size / 1024 / 1024).toFixed(1)}MB CSV`);
 
-    const aliases = nameAlias
-      .filter((n: any) => n !== primaryName)
-      .map((n: any) => clean(n["@_wholeName"]))
-      .filter(Boolean);
+  const stream = createReadStream(filepath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
-    const subjectType = clean(ent?.subjectType?.["@_code"]).toLowerCase();
-    let type: SanctionEntity["type"] = "unknown";
-    if (subjectType.includes("person")) type = "individual";
-    else if (subjectType.includes("enterprise")) type = "entity";
-
-    const regulations = toArray(ent.regulation);
-    const programs = regulations
-      .map((r: any) => clean(r["@_programme"]))
-      .filter(Boolean);
-
-    const citizenships = toArray(ent.citizenship);
-    const countries = [
-      ...new Set(
-        citizenships
-          .map((c: any) => clean(c["@_countryDescription"]))
-          .filter(Boolean)
-      ),
-    ];
-
-    const identifications = toArray(ent.identification);
-    const identifiers = identifications
-      .map(
-        (id: any) =>
-          `${clean(id["@_identificationTypeDescription"])}: ${clean(id["@_number"])}`
-      )
-      .filter((s: string) => s !== ": ");
-
-    return {
-      id: `eu:${clean(ent["@_euReferenceNumber"])}`,
-      source: "eu",
-      name,
-      aliases,
-      type,
-      programs: [...new Set(programs)],
-      countries,
-      identifiers,
-      date_listed: clean(ent["@_designationDate"]),
-      remarks: clean(ent.remark),
-    };
-  });
-}
-
-// ---------------------------------------------------------------------------
-// UN Consolidated
-// ---------------------------------------------------------------------------
-function parseUnXml(filepath: string): SanctionEntity[] {
-  const xml = readFileSync(filepath, "utf-8");
-  const parser = makeXmlParser();
-  const doc = parser.parse(xml);
-
-  const results: SanctionEntity[] = [];
-  const root = doc?.CONSOLIDATED_LIST;
-
-  // Individuals
-  const individuals = toArray(root?.INDIVIDUALS?.INDIVIDUAL);
-  for (const ind of individuals) {
-    const parts = [
-      clean(ind.FIRST_NAME),
-      clean(ind.SECOND_NAME),
-      clean(ind.THIRD_NAME),
-    ].filter(Boolean);
-    const name = parts.join(" ");
-
-    const aliases = toArray(ind.INDIVIDUAL_ALIAS).map((a: any) =>
-      [clean(a.ALIAS_NAME)].filter(Boolean).join(" ")
-    );
-
-    const countries = [
-      ...new Set(
-        toArray(ind.INDIVIDUAL_ADDRESS)
-          .map((a: any) => clean(a.COUNTRY))
-          .filter(Boolean)
-      ),
-    ];
-
-    const identifiers = toArray(ind.INDIVIDUAL_DOCUMENT).map(
-      (d: any) => `${clean(d.TYPE_OF_DOCUMENT)}: ${clean(d.NUMBER)}`
-    );
-
-    results.push({
-      id: `un:${clean(ind.DATAID)}`,
-      source: "un",
-      name,
-      aliases: aliases.filter(Boolean),
-      type: "individual",
-      programs: toArray(ind.UN_LIST_TYPE).map(clean).filter(Boolean),
-      countries,
-      identifiers,
-      date_listed: clean(ind.LISTED_ON),
-      remarks: clean(ind.COMMENTS1),
-    });
-  }
-
-  // Entities
-  const ents = toArray(root?.ENTITIES?.ENTITY);
-  for (const ent of ents) {
-    const name = clean(ent.FIRST_NAME);
-
-    const aliases = toArray(ent.ENTITY_ALIAS)
-      .map((a: any) => clean(a.ALIAS_NAME))
-      .filter(Boolean);
-
-    const countries = [
-      ...new Set(
-        toArray(ent.ENTITY_ADDRESS)
-          .map((a: any) => clean(a.COUNTRY))
-          .filter(Boolean)
-      ),
-    ];
-
-    results.push({
-      id: `un:${clean(ent.DATAID)}`,
-      source: "un",
-      name,
-      aliases,
-      type: "entity",
-      programs: toArray(ent.UN_LIST_TYPE).map(clean).filter(Boolean),
-      countries,
-      identifiers: [],
-      date_listed: clean(ent.LISTED_ON),
-      remarks: clean(ent.COMMENTS1),
-    });
-  }
-
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// UK HMT CSV
-// ---------------------------------------------------------------------------
-function parseUkCsv(filepath: string): SanctionEntity[] {
-  const raw = readFileSync(filepath, "utf-8").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = raw.split("\n");
-  if (lines.length < 3) return [];
-
-  // First line is "Last Updated,<date>" — skip it. Headers are on line 2.
-  const headers = parseCsvLine(lines[1]);
-  const col = (row: string[], name: string) => {
-    const idx = headers.indexOf(name);
-    return idx >= 0 ? (row[idx] ?? "").trim() : "";
-  };
-
+  let lineNum = 0;
+  let headers: string[] = [];
   const grouped = new Map<string, string[][]>();
-  for (let i = 2; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+
+  for await (const line of rl) {
+    lineNum++;
+    if (lineNum === 1) continue; // "Last Updated,<date>" — skip
+    if (lineNum === 2) {
+      headers = parseCsvLine(line);
+      continue;
+    }
+    if (!line.trim()) continue;
     const row = parseCsvLine(line);
-    const groupId = col(row, "Group ID");
+    const groupIdIdx = headers.indexOf("Group ID");
+    const groupId = groupIdIdx >= 0 ? (row[groupIdIdx] ?? "").trim() : "";
     if (!groupId) continue;
     if (!grouped.has(groupId)) grouped.set(groupId, []);
     grouped.get(groupId)!.push(row);
   }
 
-  const results: SanctionEntity[] = [];
+  const col = (row: string[], name: string) => {
+    const idx = headers.indexOf(name);
+    return idx >= 0 ? (row[idx] ?? "").trim() : "";
+  };
+
+  let count = 0;
   for (const [groupId, rows] of grouped) {
     const first = rows[0];
     const nameParts = [
@@ -414,7 +311,7 @@ function parseUkCsv(filepath: string): SanctionEntity[] {
     const country = col(first, "Country");
     const regime = col(first, "Regime");
 
-    results.push({
+    onEntity({
       id: `uk_hmt:${groupId}`,
       source: "uk_hmt",
       name,
@@ -426,64 +323,402 @@ function parseUkCsv(filepath: string): SanctionEntity[] {
       date_listed: col(first, "Listed On"),
       remarks: col(first, "Other Information"),
     });
+    count++;
   }
 
-  return results;
+  // Free the grouped map immediately
+  grouped.clear();
+
+  console.log(`[parse] uk_hmt: ${count} entities parsed`);
+  return count;
 }
 
-function parseCsvLine(line: string): string[] {
-  const fields: string[] = [];
-  let current = "";
-  let inQuotes = false;
+// ---------------------------------------------------------------------------
+// EU XML — SAX streaming parser
+// ---------------------------------------------------------------------------
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (i + 1 < line.length && line[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuotes = false;
+function clean(val: unknown): string {
+  if (val == null) return "";
+  return String(val).trim();
+}
+
+async function streamEuXml(
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
+  const size = statSync(filepath).size;
+  console.log(`[parse] eu: ${(size / 1024 / 1024).toFixed(1)}MB XML (SAX streaming)`);
+
+  return new Promise((resolve, reject) => {
+    const parser = sax.createStream(false, {
+      lowercase: true,
+      trim: true,
+      normalize: true,
+    });
+
+    let count = 0;
+    const tagStack: string[] = [];
+
+    // Current entity state
+    let inEntity = false;
+    let entityRefNum = "";
+    let entityDesignationDate = "";
+    let entityRemark = "";
+    let entitySubjectTypeCode = "";
+
+    // nameAlias entries
+    let nameAliases: Array<{
+      wholeName: string;
+      nameStatus: string;
+      strong: string;
+    }> = [];
+
+    // regulation entries
+    let regulations: string[] = [];
+
+    // citizenship entries
+    let citizenships: string[] = [];
+
+    // identification entries
+    let identifications: Array<{ type: string; number: string }> = [];
+
+    parser.on("opentag", (node: sax.Tag) => {
+      const tag = node.name;
+      tagStack.push(tag);
+
+      if (tag === "sanctionentity") {
+        inEntity = true;
+        entityRefNum = (node.attributes.eureferenceNumber as string) ?? "";
+        entityDesignationDate = (node.attributes.designationdate as string) ?? "";
+        entityRemark = "";
+        entitySubjectTypeCode = "";
+        nameAliases = [];
+        regulations = [];
+        citizenships = [];
+        identifications = [];
+      } else if (inEntity && tag === "namealias") {
+        nameAliases.push({
+          wholeName: (node.attributes.wholename as string) ?? "",
+          nameStatus: (node.attributes.namestatus as string) ?? "",
+          strong: (node.attributes.strong as string) ?? "",
+        });
+      } else if (inEntity && tag === "subjecttype") {
+        entitySubjectTypeCode = ((node.attributes.code as string) ?? "").toLowerCase();
+      } else if (inEntity && tag === "regulation") {
+        const programme = (node.attributes.programme as string) ?? "";
+        if (programme) regulations.push(programme);
+      } else if (inEntity && tag === "citizenship") {
+        const cd = (node.attributes.countrydescription as string) ?? "";
+        if (cd) citizenships.push(cd);
+      } else if (inEntity && tag === "identification") {
+        identifications.push({
+          type: (node.attributes.identificationtypedescription as string) ?? "",
+          number: (node.attributes.number as string) ?? "",
+        });
+      }
+    });
+
+    parser.on("text", (text: string) => {
+      if (inEntity && tagStack[tagStack.length - 1] === "remark") {
+        entityRemark += text;
+      }
+    });
+
+    parser.on("closetag", (tag: string) => {
+      tagStack.pop();
+
+      if (tag === "sanctionentity" && inEntity) {
+        // Build entity and emit immediately
+        const primaryName =
+          nameAliases.find(
+            (n) => n.nameStatus === "primary" || n.strong === "true"
+          ) || nameAliases[0];
+        const name = clean(primaryName?.wholeName);
+
+        if (name) {
+          const aliases = nameAliases
+            .filter((n) => n !== primaryName)
+            .map((n) => clean(n.wholeName))
+            .filter(Boolean);
+
+          let type: SanctionEntity["type"] = "unknown";
+          if (entitySubjectTypeCode.includes("person")) type = "individual";
+          else if (entitySubjectTypeCode.includes("enterprise")) type = "entity";
+
+          const identifiers = identifications
+            .map((id) => `${clean(id.type)}: ${clean(id.number)}`)
+            .filter((s) => s !== ": ");
+
+          onEntity({
+            id: `eu:${clean(entityRefNum)}`,
+            source: "eu",
+            name,
+            aliases,
+            type,
+            programs: [...new Set(regulations)],
+            countries: [...new Set(citizenships)],
+            identifiers,
+            date_listed: clean(entityDesignationDate),
+            remarks: clean(entityRemark),
+          });
+          count++;
         }
-      } else {
-        current += ch;
+
+        // Reset state — free arrays immediately
+        inEntity = false;
+        nameAliases = [];
+        regulations = [];
+        citizenships = [];
+        identifications = [];
       }
-    } else {
-      if (ch === '"') {
-        inQuotes = true;
-      } else if (ch === ",") {
-        fields.push(current);
-        current = "";
-      } else {
-        current += ch;
-      }
-    }
-  }
-  fields.push(current);
-  return fields;
+    });
+
+    parser.on("error", (err: Error) => {
+      console.warn(`[parse] eu: SAX error (continuing): ${err.message}`);
+      (parser as any)._parser.error = null;
+      (parser as any)._parser.resume();
+    });
+
+    parser.on("end", () => {
+      console.log(`[parse] eu: ${count} entities parsed`);
+      resolve(count);
+    });
+
+    const fileStream = createReadStream(filepath, { encoding: "utf-8" });
+    fileStream.on("error", reject);
+    fileStream.pipe(parser);
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Dispatcher
+// UN XML — SAX streaming parser
 // ---------------------------------------------------------------------------
+
+async function streamUnXml(
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
+  const size = statSync(filepath).size;
+  console.log(`[parse] un: ${(size / 1024 / 1024).toFixed(1)}MB XML (SAX streaming)`);
+
+  return new Promise((resolve, reject) => {
+    const parser = sax.createStream(false, {
+      lowercase: true,
+      trim: true,
+      normalize: true,
+    });
+
+    let count = 0;
+    const tagStack: string[] = [];
+    let textBuffer = "";
+
+    // Track if we're in INDIVIDUAL or ENTITY
+    let recordType: "individual" | "entity" | null = null;
+
+    // Current record fields
+    let dataId = "";
+    let firstName = "";
+    let secondName = "";
+    let thirdName = "";
+    let listedOn = "";
+    let comments = "";
+    let unListTypes: string[] = [];
+
+    // Alias collection
+    let aliases: string[] = [];
+    let currentAliasName = "";
+
+    // Address/country collection
+    let countries: string[] = [];
+    let currentCountry = "";
+
+    // Document collection
+    let identifiers: string[] = [];
+    let currentDocType = "";
+    let currentDocNumber = "";
+
+    function resetRecord() {
+      recordType = null;
+      dataId = "";
+      firstName = "";
+      secondName = "";
+      thirdName = "";
+      listedOn = "";
+      comments = "";
+      unListTypes = [];
+      aliases = [];
+      currentAliasName = "";
+      countries = [];
+      currentCountry = "";
+      identifiers = [];
+      currentDocType = "";
+      currentDocNumber = "";
+    }
+
+    parser.on("opentag", (node: sax.Tag) => {
+      const tag = node.name;
+      tagStack.push(tag);
+      textBuffer = "";
+
+      if (tag === "individual") {
+        resetRecord();
+        recordType = "individual";
+      } else if (tag === "entity") {
+        resetRecord();
+        recordType = "entity";
+      }
+    });
+
+    parser.on("text", (text: string) => {
+      textBuffer += text;
+    });
+
+    parser.on("cdata", (text: string) => {
+      textBuffer += text;
+    });
+
+    parser.on("closetag", (tag: string) => {
+      const text = textBuffer.trim();
+
+      if (recordType) {
+        if (tag === "dataid") dataId = text;
+        else if (tag === "first_name") firstName = text;
+        else if (tag === "second_name") secondName = text;
+        else if (tag === "third_name") thirdName = text;
+        else if (tag === "listed_on") listedOn = text;
+        else if (tag === "comments1") comments = text;
+        else if (tag === "un_list_type" && text) unListTypes.push(text);
+        else if (tag === "alias_name") currentAliasName = text;
+        else if (
+          (tag === "individual_alias" || tag === "entity_alias") &&
+          currentAliasName
+        ) {
+          aliases.push(currentAliasName);
+          currentAliasName = "";
+        }
+        else if (tag === "country") currentCountry = text;
+        else if (
+          (tag === "individual_address" || tag === "entity_address") &&
+          currentCountry
+        ) {
+          countries.push(currentCountry);
+          currentCountry = "";
+        }
+        else if (tag === "type_of_document") currentDocType = text;
+        else if (tag === "number") currentDocNumber = text;
+        else if (tag === "individual_document") {
+          if (currentDocType || currentDocNumber) {
+            identifiers.push(`${currentDocType}: ${currentDocNumber}`);
+          }
+          currentDocType = "";
+          currentDocNumber = "";
+        }
+        // Emit on record close
+        else if (tag === "individual" || tag === "entity") {
+          let name: string;
+          if (recordType === "individual") {
+            name = [firstName, secondName, thirdName].filter(Boolean).join(" ");
+          } else {
+            name = firstName;
+          }
+
+          if (name && dataId) {
+            onEntity({
+              id: `un:${dataId}`,
+              source: "un",
+              name,
+              aliases: aliases.filter(Boolean),
+              type: recordType,
+              programs: unListTypes,
+              countries: [...new Set(countries)],
+              identifiers,
+              date_listed: listedOn,
+              remarks: comments,
+            });
+            count++;
+          }
+
+          resetRecord();
+        }
+      }
+
+      tagStack.pop();
+      textBuffer = "";
+    });
+
+    parser.on("error", (err: Error) => {
+      console.warn(`[parse] un: SAX error (continuing): ${err.message}`);
+      (parser as any)._parser.error = null;
+      (parser as any)._parser.resume();
+    });
+
+    parser.on("end", () => {
+      console.log(`[parse] un: ${count} entities parsed`);
+      resolve(count);
+    });
+
+    const fileStream = createReadStream(filepath, { encoding: "utf-8" });
+    fileStream.on("error", reject);
+    fileStream.pipe(parser);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher — all parsers are streaming, calling onEntity per record
+// ---------------------------------------------------------------------------
+
+export async function streamParseSource(
+  source: DataSource,
+  filepath: string,
+  onEntity: EntityCallback
+): Promise<number> {
+  switch (source.id) {
+    case "ofac_sdn":
+      return streamOfacSdnCsv(filepath, onEntity);
+    case "ofac_consolidated":
+      return streamOfacConsolidatedCsv(filepath, onEntity);
+    case "eu":
+      return streamEuXml(filepath, onEntity);
+    case "un":
+      return streamUnXml(filepath, onEntity);
+    case "uk_hmt":
+      return streamUkCsv(filepath, onEntity);
+    default:
+      console.warn(`No parser for source: ${source.id}`);
+      return 0;
+  }
+}
+
+// Legacy sync interface (kept for compatibility but avoid using)
 export function parseSource(
   source: DataSource,
   filepath: string
 ): SanctionEntity[] {
-  switch (source.id) {
-    case "ofac_sdn":
-      return parseOfacSdnCsv(filepath);
-    case "ofac_consolidated":
-      return parseOfacConsolidatedCsv(filepath);
-    case "eu":
-      return parseEuXml(filepath);
-    case "un":
-      return parseUnXml(filepath);
-    case "uk_hmt":
-      return parseUkCsv(filepath);
-    default:
-      console.warn(`No parser for source: ${source.id}`);
-      return [];
+  console.warn("[parse] WARNING: using sync parseSource — prefer streamParseSource");
+  const entities: SanctionEntity[] = [];
+  const raw = readFileSync(filepath, "utf-8");
+  if (source.format === "csv") {
+    const lines = raw.split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const fields = parseCsvLine(line);
+      const entNum = fields[0]?.trim();
+      if (!entNum || entNum === "-0-") continue;
+      const name = fields[1]?.trim() ?? "";
+      if (!name) continue;
+      entities.push({
+        id: `${source.id}:${entNum}`,
+        source: source.id,
+        name,
+        aliases: [],
+        type: "unknown",
+        programs: [],
+        countries: [],
+        identifiers: [],
+        date_listed: "",
+        remarks: "",
+      });
+    }
   }
+  return entities;
 }

@@ -6,8 +6,12 @@ import cron from "node-cron";
 import { Mppx, tempo } from "mppx/hono";
 import { initDatabase, getDb } from "./db.js";
 import { screenEntity, batchScreen } from "./match.js";
-import { downloadAllSources } from "./ingest/download.js";
-import { parseSource, tryGc } from "./ingest/parse.js";
+import {
+  runInitialIngestion,
+  runPepIngestion,
+  runDailyRefresh,
+  progress,
+} from "./ingest/ingest.js";
 import {
   initX402,
   x402Charge,
@@ -125,10 +129,16 @@ app.get("/api", (c) =>
 );
 
 app.get("/api/status", (c) => {
+  // Always show real-time progress
   if (!dataReady) {
     return c.json({
-      state: "initializing",
-      message: "Data loading in progress",
+      state: progress.state,
+      message: progress.state === "idle" ? "Waiting to start" : "Data loading in progress",
+      currentSource: progress.currentSource,
+      sourcesLoaded: progress.sourcesLoaded,
+      totalEntities: progress.totalEntities,
+      errors: progress.errors,
+      heap_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       matching_method: "FTS5 + Levenshtein + token overlap",
       update_frequency: "daily",
     });
@@ -161,6 +171,7 @@ app.get("/api/status", (c) => {
     state: "ready",
     lists,
     total_entities: total.count,
+    heap_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
     matching_method: "FTS5 + Levenshtein + token overlap",
     update_frequency: "daily",
   });
@@ -176,7 +187,7 @@ app.get("/.well-known/mcp.json", async (c) => {
 
 // --- Paid endpoints -------------------------------------------------------
 
-// Block screening endpoints until data is loaded
+// Block screening endpoints until data is loaded — return 503
 app.use("/api/screen", async (c, next) => {
   if (!dataReady) {
     return c.json(
@@ -232,9 +243,7 @@ app.post(
   "/api/batch",
   x402BatchCharge(),
   async (c, next) => {
-    // If x402 already handled payment, skip MPP
     if (c.get("paymentHandled" as never)) return next();
-    // Dynamic pricing: peek at entity count to set the amount
     const body = await c.req.json().catch(() => null);
     if (!body?.entities || !Array.isArray(body.entities)) {
       return c.json(
@@ -254,9 +263,7 @@ app.post(
         400
       );
     }
-    // Store parsed body for downstream handler
     c.set("batchBody" as never, body as never);
-    // Apply payment middleware with dynamic amount
     const amount = (body.entities.length * 0.02).toFixed(2);
     if (TESTNET) return next();
     const paymentMiddleware = mppx.charge({
@@ -286,57 +293,11 @@ app.post(
 // ---------------------------------------------------------------------------
 // Data refresh (daily at 06:00 UTC)
 // ---------------------------------------------------------------------------
-async function refreshData() {
-  console.log("[cron] Starting daily sanctions + PEP data refresh...");
-  try {
-    const results = await downloadAllSources();
-    const succeeded = results.filter((r) => r.filepath !== null);
-    if (succeeded.length === 0) {
-      console.error("[cron] No sources downloaded. Skipping refresh.");
-      return;
-    }
-    const { resetDatabase, insertEntities } = await import("./db.js");
-    resetDatabase();
-    let total = 0;
-    for (const result of succeeded) {
-      try {
-        let entities: ReturnType<typeof parseSource> | null = parseSource(result.source, result.filepath!);
-        insertEntities(entities);
-        total += entities.length;
-        entities = null;
-        tryGc();
-      } catch (err) {
-        console.error(
-          `[cron] Failed to parse ${result.source.name}:`,
-          err instanceof Error ? err.message : err
-        );
-      }
-    }
-    // Mark ready with sanctions data before attempting PEP ingestion
-    dataReady = true;
-    console.log(`[cron] Sanctions loaded. ${total} entities indexed. Server ready.`);
-
-    // PEP ingestion (non-fatal — server stays up with sanctions-only if this fails)
-    try {
-      const { ingestPep } = await import("./ingest/pep.js");
-      const pepEntities = await ingestPep();
-      if (pepEntities.length > 0) {
-        insertEntities(pepEntities);
-        total += pepEntities.length;
-        console.log(`[cron] PEP ingestion added ${pepEntities.length} entities. Total: ${total}`);
-      }
-    } catch (err) {
-      console.error(
-        "[cron] PEP ingestion failed:",
-        err instanceof Error ? err.message : err
-      );
-    }
-  } catch (err) {
+cron.schedule("0 6 * * *", () => {
+  runDailyRefresh().catch((err) => {
     console.error("[cron] Refresh failed:", err);
-  }
-}
-
-cron.schedule("0 6 * * *", refreshData, { timezone: "UTC" });
+  });
+}, { timezone: "UTC" });
 
 // ---------------------------------------------------------------------------
 // Startup
@@ -346,7 +307,9 @@ initDatabase();
 if (TESTNET) console.log("⚠ TESTNET mode: payments disabled");
 
 // Initialize x402 (async, non-blocking — server starts immediately)
-initX402().catch(() => {});
+initX402().catch((err) => {
+  console.warn("[x402] Initialization failed (non-fatal):", err instanceof Error ? err.message : err);
+});
 
 console.log(`Argvs running on port ${PORT} (data loading in background...)`);
 
@@ -355,15 +318,37 @@ serve({ fetch: app.fetch, port: PORT });
 // Run initial data ingestion in the background after server starts
 (async () => {
   try {
-    await refreshData();
+    // Phase 1: Load sanctions lists (streaming)
+    await runInitialIngestion();
     dataReady = true;
+
     const total = (
       getDb().prepare("SELECT COUNT(*) as count FROM entities").get() as {
         count: number;
       }
     ).count;
-    console.log(`[startup] Data ready. ${total} entities loaded.`);
+    console.log(`[startup] Sanctions ready. ${total} entities loaded. Accepting requests.`);
+
+    // Phase 2: Load PEPs in background (server already accepting requests)
+    await runPepIngestion();
+
+    const finalTotal = (
+      getDb().prepare("SELECT COUNT(*) as count FROM entities").get() as {
+        count: number;
+      }
+    ).count;
+    console.log(`[startup] Full data ready. ${finalTotal} entities total.`);
   } catch (err) {
     console.error("[startup] Initial ingestion failed:", err);
+    // Mark ready anyway if we have any data
+    const count = (
+      getDb().prepare("SELECT COUNT(*) as count FROM entities").get() as {
+        count: number;
+      }
+    ).count;
+    if (count > 0) {
+      dataReady = true;
+      console.log(`[startup] Partial data available: ${count} entities. Server ready.`);
+    }
   }
 })();

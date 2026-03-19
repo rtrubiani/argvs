@@ -21,6 +21,7 @@ const SECRET_KEY =
 
 // pathUSD on Tempo
 const PATHUSD = "0x20c0000000000000000000000000000000000000";
+const TESTNET = process.env.TESTNET === "true";
 
 // ---------------------------------------------------------------------------
 // MPP payment handler
@@ -34,6 +35,10 @@ const mppx = Mppx.create({
   ],
   secretKey: SECRET_KEY,
 });
+
+// In testnet mode, skip payment and pass through
+const noopCharge = (_opts: { amount: string; description: string }) =>
+  async (_c: any, next: any) => next();
 
 // ---------------------------------------------------------------------------
 // App
@@ -131,7 +136,7 @@ app.get("/.well-known/mcp.json", async (c) => {
 
 app.post(
   "/api/screen",
-  mppx.charge({
+  (TESTNET ? noopCharge : mppx.charge)({
     amount: "0.03",
     description: "Argvs: single sanctions screen",
   }),
@@ -176,6 +181,7 @@ app.post(
     c.set("batchBody" as never, body as never);
     // Apply payment middleware with dynamic amount
     const amount = (body.entities.length * 0.02).toFixed(2);
+    if (TESTNET) return next();
     const paymentMiddleware = mppx.charge({
       amount,
       description: `Argvs: batch screen (${body.entities.length} entities)`,
@@ -238,6 +244,7 @@ const totalEntities = (
 ).count;
 
 console.log(`Loaded ${totalEntities} entities`);
+if (TESTNET) console.log("⚠ TESTNET mode: payments disabled");
 console.log(`Argvs running on port ${PORT}`);
 
 serve({ fetch: app.fetch, port: PORT });

@@ -37,8 +37,8 @@ const WALLET =
 const SECRET_KEY =
   process.env.MPP_SECRET_KEY ?? randomBytes(32).toString("base64");
 
-// pathUSD on Tempo
-const PATHUSD = "0x20c0000000000000000000000000000000000000";
+// USDC on Tempo mainnet
+const USDC_TEMPO = "0x20c000000000000000000000b9537d11c60e8b50";
 const TESTNET = process.env.TESTNET === "true";
 
 // ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ const TESTNET = process.env.TESTNET === "true";
 const mppx = Mppx.create({
   methods: [
     tempo.charge({
-      currency: PATHUSD as `0x${string}`,
+      currency: USDC_TEMPO as `0x${string}`,
       recipient: WALLET as `0x${string}`,
     }),
   ],
@@ -99,12 +99,12 @@ app.get("/api", (c) =>
         description: "Service discovery and documentation",
       },
     ],
-    payment: ["MPP/Tempo (pathUSD)", "x402/Base (USDC)"],
+    payment: ["MPP/Tempo (USDC)", "x402/Base (USDC)"],
     paymentMethods: [
       {
         protocol: "MPP/Tempo",
         network: "Tempo",
-        currency: "pathUSD",
+        currency: "USDC",
         wallet: WALLET,
       },
       {

@@ -7,7 +7,7 @@ Argvs screens names against international sanctions lists (OFAC SDN, OFAC Consol
 Base URL: `http://localhost:3000`
 
 Payment: Two options available:
-- **MPP/Tempo** — pathUSD stablecoins on Tempo blockchain
+- **MPP/Tempo** — USDC stablecoins on Tempo blockchain
 - **x402/Base** — USDC on Base via the x402 payment protocol (facilitator: `https://facilitator.x402.org`)
 
 ## Endpoints

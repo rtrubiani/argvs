@@ -1,25 +1,41 @@
+export interface DataSourceFile {
+  url: string;
+  filename: string;
+}
+
 export interface DataSource {
   id: string;
   name: string;
   url: string;
   format: "xml" | "csv";
   filename: string;
+  extraFiles?: DataSourceFile[];
 }
 
 export const sources: DataSource[] = [
   {
     id: "ofac_sdn",
     name: "OFAC SDN",
-    url: "https://www.treasury.gov/ofac/downloads/sanctions/1.0/sdn_advanced.xml",
-    format: "xml",
-    filename: "ofac_sdn.xml",
+    url: "https://www.treasury.gov/ofac/downloads/sdn.csv",
+    format: "csv",
+    filename: "ofac_sdn.csv",
+    extraFiles: [
+      {
+        url: "https://www.treasury.gov/ofac/downloads/add.csv",
+        filename: "ofac_sdn_add.csv",
+      },
+      {
+        url: "https://www.treasury.gov/ofac/downloads/alt.csv",
+        filename: "ofac_sdn_alt.csv",
+      },
+    ],
   },
   {
     id: "ofac_consolidated",
     name: "OFAC Consolidated (Non-SDN)",
-    url: "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/CONS_ADVANCED.XML",
-    format: "xml",
-    filename: "ofac_consolidated.xml",
+    url: "https://www.treasury.gov/ofac/downloads/consolidated/cons_prim.csv",
+    format: "csv",
+    filename: "ofac_consolidated.csv",
   },
   {
     id: "eu",

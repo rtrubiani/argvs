@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { XMLParser } from "fast-xml-parser";
 import type { DataSource } from "./sources.js";
 
@@ -40,266 +41,161 @@ function makeXmlParser(): XMLParser {
 }
 
 // ---------------------------------------------------------------------------
-// OFAC lookup context (shared across batches)
+// Shared CSV helper: determine OFAC entity type from SDN_Type field
 // ---------------------------------------------------------------------------
-interface OfacLookups {
-  partySubTypes: Map<string, { name: string; partyTypeId: string }>;
-  partyTypes: Map<string, string>;
-  locationCountries: Map<string, string>;
-  profilePrograms: Map<string, string[]>;
-  profileDates: Map<string, string>;
+function ofacEntityType(sdnType: string): SanctionEntity["type"] {
+  const t = sdnType.toLowerCase().trim();
+  if (t === "individual") return "individual";
+  if (t === "entity") return "entity";
+  if (t === "vessel") return "vessel";
+  if (t === "aircraft") return "aircraft";
+  return "unknown";
 }
 
 // ---------------------------------------------------------------------------
-// Process a single parsed DistinctParty object into a SanctionEntity
-// ---------------------------------------------------------------------------
-function processOfacParty(
-  party: any,
-  sourceId: string,
-  ctx: OfacLookups
-): SanctionEntity | null {
-  const profile = party.Profile;
-  if (!profile) return null;
-
-  const profileId = clean(profile["@_ID"]);
-  const partySubTypeId = clean(profile["@_PartySubTypeID"]);
-  const subType = ctx.partySubTypes.get(partySubTypeId);
-  const partyTypeName = subType
-    ? ctx.partyTypes.get(subType.partyTypeId)?.toLowerCase() ?? ""
-    : "";
-
-  let type: SanctionEntity["type"] = "unknown";
-  if (partyTypeName.includes("individual")) type = "individual";
-  else if (partyTypeName.includes("entity")) type = "entity";
-  else if (subType?.name.toLowerCase().includes("vessel")) type = "vessel";
-  else if (subType?.name.toLowerCase().includes("aircraft")) type = "aircraft";
-
-  const identity = toArray(profile.Identity)[0];
-  if (!identity) return null;
-
-  const aliases = toArray(identity.Alias);
-  let primaryName = "";
-  const aliasNames: string[] = [];
-
-  for (const alias of aliases) {
-    const isPrimary = clean(alias["@_Primary"]) === "true";
-    const docNames = toArray(alias.DocumentedName);
-    for (const docName of docNames) {
-      const parts = toArray(docName.DocumentedNamePart);
-      const nameParts = parts.map((p: any) =>
-        clean(
-          Array.isArray(p.NamePartValue)
-            ? p.NamePartValue[0]?.["#text"] ?? p.NamePartValue[0]
-            : p.NamePartValue?.["#text"] ?? p.NamePartValue
-        )
-      );
-      const fullName = nameParts.filter(Boolean).join(" ");
-      if (!fullName) continue;
-
-      if (isPrimary && !primaryName) {
-        primaryName = fullName;
-      } else {
-        aliasNames.push(fullName);
-      }
-    }
-  }
-
-  if (!primaryName) {
-    primaryName = aliasNames.shift() ?? "";
-  }
-  if (!primaryName) return null;
-
-  const countries: string[] = [];
-  for (const feature of toArray(profile.Feature)) {
-    for (const fv of toArray(feature.FeatureVersion)) {
-      const locId = clean(fv.VersionLocation?.["@_LocationID"]);
-      const country = ctx.locationCountries.get(locId);
-      if (country) countries.push(country);
-    }
-  }
-
-  return {
-    id: `${sourceId}:${profileId}`,
-    source: sourceId,
-    name: primaryName,
-    aliases: [...new Set(aliasNames)],
-    type,
-    programs: ctx.profilePrograms.get(profileId) ?? [],
-    countries: [...new Set(countries)],
-    identifiers: [],
-    date_listed: ctx.profileDates.get(profileId) ?? "",
-    remarks: clean(party.Comment),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Parse a batch of DistinctParty XML strings
-// ---------------------------------------------------------------------------
-function processOfacBatch(
-  batch: string[],
-  parser: XMLParser,
-  sourceId: string,
-  ctx: OfacLookups,
-  results: SanctionEntity[]
-): void {
-  const batchXml = `<B>${batch.join("")}</B>`;
-  const doc = parser.parse(batchXml);
-  const parties = toArray(doc?.B?.DistinctParty);
-
-  for (const party of parties) {
-    const entity = processOfacParty(party, sourceId, ctx);
-    if (entity) results.push(entity);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// OFAC Advanced XML — chunked parsing to stay within 512MB RAM
+// OFAC SDN CSV — line-by-line parsing of sdn.csv + alt.csv + add.csv
 //
-// Instead of parsing the entire 117MB XML at once (which creates a ~400MB JS
-// object), we:
-//   1. Extract and parse only the reference sections (small)
-//   2. Split DistinctParty entries and parse in batches of 200
-//   3. Free intermediate data between steps
+// sdn.csv columns (no header, positional):
+//   0: ent_num, 1: SDN_Name, 2: SDN_Type, 3: Program, 4: Title,
+//   5: Call_Sign, 6: Vess_type, 7: Tonnage, 8: GRT, 9: Vess_flag,
+//   10: Vess_owner, 11: Remarks
+//
+// alt.csv columns: ent_num, alt_num, alt_type, alt_name, alt_remarks
+// add.csv columns: ent_num, add_num, Address, City, Country, add_remarks
 // ---------------------------------------------------------------------------
-const OFAC_BATCH_SIZE = 200;
+function parseOfacSdnCsv(filepath: string): SanctionEntity[] {
+  const dataDir = dirname(filepath);
 
-function parseOfacAdvancedXml(
-  filepath: string,
-  sourceId: string
-): SanctionEntity[] {
-  // Step 1: Read full file
-  let raw: string | null = readFileSync(filepath, "utf-8");
-  console.log(
-    `[parse] ${sourceId}: ${(raw.length / 1024 / 1024).toFixed(1)}MB XML`
-  );
-
-  // Step 2: Locate DistinctParties section
-  const dpStartIdx = raw.indexOf("<DistinctParties");
-  const dpCloseTag = "</DistinctParties>";
-  const dpEndIdx = raw.lastIndexOf(dpCloseTag);
-
-  if (dpStartIdx === -1 || dpEndIdx === -1) {
-    console.warn(`[parse] ${sourceId}: no DistinctParties section found`);
-    return [];
+  // Build alias lookup from alt.csv (ent_num → alias names)
+  const aliasMap = new Map<string, string[]>();
+  try {
+    const altRaw = readFileSync(join(dataDir, "ofac_sdn_alt.csv"), "utf-8");
+    const altLines = altRaw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    for (const line of altLines) {
+      if (!line.trim()) continue;
+      const fields = parseCsvLine(line);
+      const entNum = fields[0]?.trim();
+      const altName = fields[3]?.trim();
+      if (!entNum || !altName || entNum === "-0-") continue;
+      if (!aliasMap.has(entNum)) aliasMap.set(entNum, []);
+      aliasMap.get(entNum)!.push(altName);
+    }
+  } catch (err) {
+    console.warn("[parse] ofac_sdn: could not read alt.csv, continuing without aliases");
   }
 
-  // Find end of the opening tag (handles attributes on the element)
-  const dpContentStart = raw.indexOf(">", dpStartIdx) + 1;
+  // Build country lookup from add.csv (ent_num → countries)
+  const countryMap = new Map<string, string[]>();
+  try {
+    const addRaw = readFileSync(join(dataDir, "ofac_sdn_add.csv"), "utf-8");
+    const addLines = addRaw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    for (const line of addLines) {
+      if (!line.trim()) continue;
+      const fields = parseCsvLine(line);
+      const entNum = fields[0]?.trim();
+      const country = fields[4]?.trim();
+      if (!entNum || !country || entNum === "-0-") continue;
+      if (!countryMap.has(entNum)) countryMap.set(entNum, []);
+      countryMap.get(entNum)!.push(country);
+    }
+  } catch (err) {
+    console.warn("[parse] ofac_sdn: could not read add.csv, continuing without countries");
+  }
 
-  // Step 3: Extract reference XML (everything before DistinctParties)
-  // and party content separately, then free the full raw string
-  const refXml = raw.substring(0, dpStartIdx) + "</Sanctions>";
-  let dpContent: string | null = raw.substring(dpContentStart, dpEndIdx);
-  raw = null;
-  tryGc();
+  // Parse main sdn.csv line by line
+  const raw = readFileSync(filepath, "utf-8");
+  console.log(
+    `[parse] ofac_sdn: ${(raw.length / 1024 / 1024).toFixed(1)}MB CSV`
+  );
+  const lines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-  // Step 4: Parse reference data and build lookup tables
-  const parser = makeXmlParser();
-  let refDoc: any = parser.parse(refXml);
-  const root = refDoc?.Sanctions;
-  if (!root) return [];
+  const results: SanctionEntity[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const fields = parseCsvLine(line);
+    const entNum = fields[0]?.trim();
+    if (!entNum || entNum === "-0-") continue;
 
-  const ctx: OfacLookups = {
-    partySubTypes: new Map(),
-    partyTypes: new Map(),
-    locationCountries: new Map(),
-    profilePrograms: new Map(),
-    profileDates: new Map(),
-  };
+    const name = fields[1]?.trim() ?? "";
+    if (!name) continue;
 
-  for (const pst of toArray(
-    root.ReferenceValueSets?.PartySubTypeValues?.PartySubType
-  )) {
-    ctx.partySubTypes.set(clean(pst["@_ID"]), {
-      name: clean(pst["#text"]),
-      partyTypeId: clean(pst["@_PartyTypeID"]),
+    const sdnType = fields[2]?.trim() ?? "";
+    const program = fields[3]?.trim() ?? "";
+    const remarks = fields[11]?.trim() ?? "";
+
+    const programs = program
+      ? program.split(";").map((p) => p.trim()).filter(Boolean)
+      : [];
+
+    const aliases = aliasMap.get(entNum) ?? [];
+    const countries = [...new Set(countryMap.get(entNum) ?? [])];
+
+    results.push({
+      id: `ofac_sdn:${entNum}`,
+      source: "ofac_sdn",
+      name,
+      aliases: [...new Set(aliases)],
+      type: ofacEntityType(sdnType),
+      programs,
+      countries,
+      identifiers: [],
+      date_listed: "",
+      remarks: remarks === "-0-" ? "" : remarks,
     });
   }
 
-  for (const pt of toArray(
-    root.ReferenceValueSets?.PartyTypeValues?.PartyType
-  )) {
-    ctx.partyTypes.set(clean(pt["@_ID"]), clean(pt["#text"]));
-  }
+  console.log(`[parse] ofac_sdn: ${results.length} entities parsed`);
+  return results;
+}
 
-  const areaCodeCountries = new Map<string, string>();
-  for (const ac of toArray(
-    root.ReferenceValueSets?.AreaCodeValues?.AreaCode
-  )) {
-    areaCodeCountries.set(clean(ac["@_ID"]), clean(ac["@_Description"]));
-  }
+// ---------------------------------------------------------------------------
+// OFAC Consolidated CSV — line-by-line parsing of cons_prim.csv
+//
+// Same column layout as sdn.csv (no header, positional):
+//   0: ent_num, 1: SDN_Name, 2: SDN_Type, 3: Program, 4: Title,
+//   5: Call_Sign, 6: Vess_type, 7: Tonnage, 8: GRT, 9: Vess_flag,
+//   10: Vess_owner, 11: Remarks
+// ---------------------------------------------------------------------------
+function parseOfacConsolidatedCsv(filepath: string): SanctionEntity[] {
+  const raw = readFileSync(filepath, "utf-8");
+  console.log(
+    `[parse] ofac_consolidated: ${(raw.length / 1024 / 1024).toFixed(1)}MB CSV`
+  );
+  const lines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-  for (const loc of toArray(root.Locations?.Location)) {
-    const countryId = clean(loc.LocationCountry?.["@_CountryID"]);
-    if (countryId && areaCodeCountries.has(countryId)) {
-      ctx.locationCountries.set(
-        clean(loc["@_ID"]),
-        areaCodeCountries.get(countryId)!
-      );
-    }
-  }
-
-  for (const entry of toArray(root.SanctionsEntries?.SanctionsEntry)) {
-    const profileId = clean(entry["@_ProfileID"]);
-    const programs: string[] = [];
-    for (const measure of toArray(entry.SanctionsMeasure)) {
-      const comment = clean(measure.Comment);
-      if (comment) programs.push(comment);
-    }
-    ctx.profilePrograms.set(profileId, programs);
-
-    const ev = toArray(entry.EntryEvent)[0];
-    if (ev) {
-      const date = ev.Date;
-      if (date) {
-        const y = clean(date.Year);
-        const m = clean(date.Month);
-        const d = clean(date.Day);
-        if (y)
-          ctx.profileDates.set(
-            profileId,
-            `${y}-${m?.padStart(2, "0")}-${d?.padStart(2, "0")}`
-          );
-      }
-    }
-  }
-
-  // Free parsed reference doc
-  refDoc = null;
-  tryGc();
-
-  // Step 5: Process DistinctParty entries in batches
   const results: SanctionEntity[] = [];
-  const PARTY_OPEN = "<DistinctParty";
-  const PARTY_CLOSE = "</DistinctParty>";
-  let searchFrom = 0;
-  let batch: string[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const fields = parseCsvLine(line);
+    const entNum = fields[0]?.trim();
+    if (!entNum || entNum === "-0-") continue;
 
-  while (true) {
-    const start = dpContent!.indexOf(PARTY_OPEN, searchFrom);
-    if (start === -1) break;
-    const closeIdx = dpContent!.indexOf(PARTY_CLOSE, start);
-    if (closeIdx === -1) break;
-    const end = closeIdx + PARTY_CLOSE.length;
+    const name = fields[1]?.trim() ?? "";
+    if (!name) continue;
 
-    batch.push(dpContent!.substring(start, end));
-    searchFrom = end;
+    const sdnType = fields[2]?.trim() ?? "";
+    const program = fields[3]?.trim() ?? "";
+    const remarks = fields[11]?.trim() ?? "";
 
-    if (batch.length >= OFAC_BATCH_SIZE) {
-      processOfacBatch(batch, parser, sourceId, ctx, results);
-      batch = [];
-    }
+    const programs = program
+      ? program.split(";").map((p) => p.trim()).filter(Boolean)
+      : [];
+
+    results.push({
+      id: `ofac_consolidated:${entNum}`,
+      source: "ofac_consolidated",
+      name,
+      aliases: [],
+      type: ofacEntityType(sdnType),
+      programs,
+      countries: [],
+      identifiers: [],
+      date_listed: "",
+      remarks: remarks === "-0-" ? "" : remarks,
+    });
   }
 
-  if (batch.length > 0) {
-    processOfacBatch(batch, parser, sourceId, ctx, results);
-  }
-
-  // Free party content
-  dpContent = null;
-  tryGc();
-
-  console.log(`[parse] ${sourceId}: ${results.length} entities parsed`);
+  console.log(`[parse] ofac_consolidated: ${results.length} entities parsed`);
   return results;
 }
 
@@ -577,9 +473,9 @@ export function parseSource(
 ): SanctionEntity[] {
   switch (source.id) {
     case "ofac_sdn":
-      return parseOfacAdvancedXml(filepath, "ofac_sdn");
+      return parseOfacSdnCsv(filepath);
     case "ofac_consolidated":
-      return parseOfacAdvancedXml(filepath, "ofac_consolidated");
+      return parseOfacConsolidatedCsv(filepath);
     case "eu":
       return parseEuXml(filepath);
     case "un":

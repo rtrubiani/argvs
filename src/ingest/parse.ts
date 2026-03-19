@@ -1,4 +1,4 @@
-import { createReadStream, readFileSync, statSync } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join, dirname } from "node:path";
 import sax from "sax";
@@ -238,6 +238,17 @@ async function streamOfacConsolidatedCsv(
 // UK HMT CSV — stream line by line, group by Group ID
 // ---------------------------------------------------------------------------
 
+// Minimal data stored per UK HMT group — only the fields we need,
+// not the full 30+ field CSV row. Prevents OOM on large files.
+interface UkGroup {
+  nameRows: string[][]; // each entry is [name6, name1, name2, name3, name4, name5]
+  groupType: string;
+  country: string;
+  regime: string;
+  listedOn: string;
+  otherInfo: string;
+}
+
 async function streamUkCsv(
   filepath: string,
   onEntity: EntityCallback
@@ -249,67 +260,80 @@ async function streamUkCsv(
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
   let lineNum = 0;
-  let headers: string[] = [];
-  const grouped = new Map<string, string[][]>();
+  // Column index cache — resolved once from headers
+  let groupIdIdx = -1;
+  let name1Idx = -1, name2Idx = -1, name3Idx = -1;
+  let name4Idx = -1, name5Idx = -1, name6Idx = -1;
+  let groupTypeIdx = -1, countryIdx = -1, regimeIdx = -1;
+  let listedOnIdx = -1, otherInfoIdx = -1;
+
+  const grouped = new Map<string, UkGroup>();
 
   for await (const line of rl) {
     lineNum++;
     if (lineNum === 1) continue; // "Last Updated,<date>" — skip
     if (lineNum === 2) {
-      headers = parseCsvLine(line);
+      const headers = parseCsvLine(line);
+      groupIdIdx = headers.indexOf("Group ID");
+      name1Idx = headers.indexOf("Name 1");
+      name2Idx = headers.indexOf("Name 2");
+      name3Idx = headers.indexOf("Name 3");
+      name4Idx = headers.indexOf("Name 4");
+      name5Idx = headers.indexOf("Name 5");
+      name6Idx = headers.indexOf("Name 6");
+      groupTypeIdx = headers.indexOf("Group Type");
+      countryIdx = headers.indexOf("Country");
+      regimeIdx = headers.indexOf("Regime");
+      listedOnIdx = headers.indexOf("Listed On");
+      otherInfoIdx = headers.indexOf("Other Information");
       continue;
     }
     if (!line.trim()) continue;
+
     const row = parseCsvLine(line);
-    const groupIdIdx = headers.indexOf("Group ID");
     const groupId = groupIdIdx >= 0 ? (row[groupIdIdx] ?? "").trim() : "";
     if (!groupId) continue;
-    if (!grouped.has(groupId)) grouped.set(groupId, []);
-    grouped.get(groupId)!.push(row);
+
+    // Extract ONLY the 6 name fields — let the full 30+ field row be GC'd
+    const names = [
+      name6Idx >= 0 ? (row[name6Idx] ?? "").trim() : "",
+      name1Idx >= 0 ? (row[name1Idx] ?? "").trim() : "",
+      name2Idx >= 0 ? (row[name2Idx] ?? "").trim() : "",
+      name3Idx >= 0 ? (row[name3Idx] ?? "").trim() : "",
+      name4Idx >= 0 ? (row[name4Idx] ?? "").trim() : "",
+      name5Idx >= 0 ? (row[name5Idx] ?? "").trim() : "",
+    ];
+
+    const existing = grouped.get(groupId);
+    if (existing) {
+      existing.nameRows.push(names);
+    } else {
+      grouped.set(groupId, {
+        nameRows: [names],
+        groupType: groupTypeIdx >= 0 ? (row[groupTypeIdx] ?? "").trim() : "",
+        country: countryIdx >= 0 ? (row[countryIdx] ?? "").trim() : "",
+        regime: regimeIdx >= 0 ? (row[regimeIdx] ?? "").trim() : "",
+        listedOn: listedOnIdx >= 0 ? (row[listedOnIdx] ?? "").trim() : "",
+        otherInfo: otherInfoIdx >= 0 ? (row[otherInfoIdx] ?? "").trim() : "",
+      });
+    }
   }
 
-  const col = (row: string[], name: string) => {
-    const idx = headers.indexOf(name);
-    return idx >= 0 ? (row[idx] ?? "").trim() : "";
-  };
-
   let count = 0;
-  for (const [groupId, rows] of grouped) {
-    const first = rows[0];
-    const nameParts = [
-      col(first, "Name 6"),
-      col(first, "Name 1"),
-      col(first, "Name 2"),
-      col(first, "Name 3"),
-      col(first, "Name 4"),
-      col(first, "Name 5"),
-    ].filter(Boolean);
-    const name = nameParts.join(" ");
+  for (const [groupId, group] of grouped) {
+    const firstNames = group.nameRows[0];
+    const name = firstNames.filter(Boolean).join(" ");
 
-    const aliases = rows
+    const aliases = group.nameRows
       .slice(1)
-      .map((r) =>
-        [
-          col(r, "Name 6"),
-          col(r, "Name 1"),
-          col(r, "Name 2"),
-          col(r, "Name 3"),
-          col(r, "Name 4"),
-          col(r, "Name 5"),
-        ]
-          .filter(Boolean)
-          .join(" ")
-      )
+      .map((ns) => ns.filter(Boolean).join(" "))
       .filter((a) => a && a !== name);
 
-    const groupType = col(first, "Group Type").toLowerCase();
+    const groupType = group.groupType.toLowerCase();
     let type: SanctionEntity["type"] = "unknown";
     if (groupType.includes("individual")) type = "individual";
     else if (groupType.includes("entity") || groupType.includes("ship"))
       type = "entity";
-
-    const country = col(first, "Country");
-    const regime = col(first, "Regime");
 
     onEntity({
       id: `uk_hmt:${groupId}`,
@@ -317,11 +341,11 @@ async function streamUkCsv(
       name,
       aliases: [...new Set(aliases)],
       type,
-      programs: regime ? [regime] : [],
-      countries: country ? [country] : [],
+      programs: group.regime ? [group.regime] : [],
+      countries: group.country ? [group.country] : [],
       identifiers: [],
-      date_listed: col(first, "Listed On"),
-      remarks: col(first, "Other Information"),
+      date_listed: group.listedOn,
+      remarks: group.otherInfo,
     });
     count++;
   }
@@ -689,36 +713,3 @@ export async function streamParseSource(
   }
 }
 
-// Legacy sync interface (kept for compatibility but avoid using)
-export function parseSource(
-  source: DataSource,
-  filepath: string
-): SanctionEntity[] {
-  console.warn("[parse] WARNING: using sync parseSource — prefer streamParseSource");
-  const entities: SanctionEntity[] = [];
-  const raw = readFileSync(filepath, "utf-8");
-  if (source.format === "csv") {
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const fields = parseCsvLine(line);
-      const entNum = fields[0]?.trim();
-      if (!entNum || entNum === "-0-") continue;
-      const name = fields[1]?.trim() ?? "";
-      if (!name) continue;
-      entities.push({
-        id: `${source.id}:${entNum}`,
-        source: source.id,
-        name,
-        aliases: [],
-        type: "unknown",
-        programs: [],
-        countries: [],
-        identifiers: [],
-        date_listed: "",
-        remarks: "",
-      });
-    }
-  }
-  return entities;
-}

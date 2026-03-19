@@ -2,9 +2,11 @@
 // PEP (Politically Exposed Persons) ingestion from Wikidata SPARQL endpoint.
 //
 // Memory-safe: processes one country at a time, inserts into SQLite
-// immediately, then frees the array. Checks heap before each country.
+// immediately via callback, uses Set<string> for dedup (not full entities).
+// Checks heap at every country boundary, stops if > 250MB.
 // ---------------------------------------------------------------------------
 
+import type Database from "better-sqlite3";
 import type { SanctionEntity } from "./parse.js";
 import { tryGc, logHeap, getHeapMB } from "./parse.js";
 import { getInsertBatch } from "../db.js";
@@ -12,8 +14,7 @@ import { getInsertBatch } from "../db.js";
 const SPARQL_ENDPOINT = "https://query.wikidata.org/sparql";
 const USER_AGENT = "Argvs PEP Screener/1.0.0 (https://github.com/anthropics/argvs; contact: argvs@vigil.dev)";
 const PAGE_SIZE = 10_000;
-const HEAP_LIMIT_MB = 300;
-const HEAP_SKIP_MB = 250;
+const HEAP_STOP_MB = 250;
 
 function cutoffDate(): string {
   const d = new Date();
@@ -22,7 +23,7 @@ function cutoffDate(): string {
 }
 
 // ---------------------------------------------------------------------------
-// SPARQL execution
+// SPARQL execution — 10 second timeout per request
 // ---------------------------------------------------------------------------
 
 interface SparqlBinding {
@@ -44,7 +45,7 @@ async function runSparqlQuery(sparql: string): Promise<SparqlBinding[]> {
       Accept: "application/sparql-results+json",
       "User-Agent": USER_AGENT,
     },
-    signal: AbortSignal.timeout(5_000),
+    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -59,7 +60,10 @@ async function runSparqlQuery(sparql: string): Promise<SparqlBinding[]> {
   } catch {
     throw new Error(`JSON parse failed (${text.length} bytes)`);
   }
-  return json.results.bindings;
+  const bindings = json.results.bindings;
+  // Free the parsed JSON shell — we only need bindings
+  (json as any).results = null;
+  return bindings;
 }
 
 async function delay(ms: number): Promise<void> {
@@ -67,57 +71,44 @@ async function delay(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Convert SPARQL bindings to entities and insert immediately
+// Process a single SPARQL binding into an entity and emit via callback.
+// Returns true if a new entity was emitted, false if duplicate/invalid.
 // ---------------------------------------------------------------------------
 
-function processBindings(
-  bindings: SparqlBinding[],
+function processBinding(
+  b: SparqlBinding,
   countryName: string,
-  existing: Map<string, SanctionEntity>
-): SanctionEntity[] {
-  const newEntities: SanctionEntity[] = [];
+  seen: Set<string>,
+  onEntity: (e: SanctionEntity) => void,
+): boolean {
+  const wikidataId = b.wikidataId?.value ?? "";
+  if (!wikidataId || seen.has(wikidataId)) return false;
 
-  for (const b of bindings) {
-    const wikidataId = b.wikidataId?.value ?? "";
-    if (!wikidataId) continue;
+  const personLabel = b.personLabel?.value ?? "";
+  if (!personLabel || personLabel === wikidataId) return false;
 
-    const personLabel = b.personLabel?.value ?? "";
-    if (!personLabel || personLabel === wikidataId) continue;
+  seen.add(wikidataId);
 
-    const position = b.positionLabel?.value ?? "";
-    const country = b.countryLabel?.value ?? countryName;
-    const startDate = b.startDate?.value?.slice(0, 10) ?? "";
-    const endDate = b.endDate?.value?.slice(0, 10) ?? "";
+  const position = b.positionLabel?.value ?? "";
+  const country = b.countryLabel?.value ?? countryName;
+  const startDate = b.startDate?.value?.slice(0, 10) ?? "";
+  const endDate = b.endDate?.value?.slice(0, 10) ?? "";
 
-    const ex = existing.get(wikidataId);
-    if (ex) {
-      if (position) {
-        const posSet = new Set(ex.programs);
-        posSet.add(position);
-        ex.programs = [...posSet];
-        ex.remarks = `Position(s): ${ex.programs.join("; ")}`;
-      }
-    } else {
-      const entity: SanctionEntity = {
-        id: `pep:${wikidataId}`,
-        source: "PEP",
-        name: personLabel,
-        aliases: [],
-        type: "individual",
-        programs: position ? [position] : [],
-        countries: country ? [country] : [],
-        identifiers: [wikidataId],
-        date_listed: startDate,
-        remarks: position
-          ? `Position(s): ${position}${endDate ? ` (ended ${endDate})` : ""}`
-          : "",
-      };
-      existing.set(wikidataId, entity);
-      newEntities.push(entity);
-    }
-  }
-
-  return newEntities;
+  onEntity({
+    id: `pep:${wikidataId}`,
+    source: "PEP",
+    name: personLabel,
+    aliases: [],
+    type: "individual",
+    programs: position ? [position] : [],
+    countries: country ? [country] : [],
+    identifiers: [wikidataId],
+    date_listed: startDate,
+    remarks: position
+      ? `Position(s): ${position}${endDate ? ` (ended ${endDate})` : ""}`
+      : "",
+  });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,17 +139,18 @@ const G20_COUNTRIES: Array<{ id: string; label: string }> = [
 ];
 
 // ---------------------------------------------------------------------------
-// Per-country politician query with pagination
+// Per-country politician fetch — streams entities via callback, no arrays
 // ---------------------------------------------------------------------------
 
 async function fetchPoliticiansByCountry(
   countryQid: string,
   countryLabel: string,
-  cutoff: string
-): Promise<SanctionEntity[]> {
-  const seen = new Map<string, SanctionEntity>();
+  cutoff: string,
+  seen: Set<string>,
+  onEntity: (e: SanctionEntity) => void,
+): Promise<number> {
   let offset = 0;
-  const allNew: SanctionEntity[] = [];
+  let count = 0;
 
   while (true) {
     const sparql = `
@@ -182,18 +174,24 @@ LIMIT ${PAGE_SIZE} OFFSET ${offset}`;
     try {
       bindings = await runSparqlQuery(sparql);
     } catch {
-      break;
+      break; // skip on failure, don't retry
     }
 
-    const newOnes = processBindings(bindings, countryLabel, seen);
-    allNew.push(...newOnes);
+    const bindingCount = bindings.length;
+    for (const b of bindings) {
+      if (processBinding(b, countryLabel, seen, onEntity)) {
+        count++;
+      }
+    }
+    // Free bindings immediately
+    bindings = null as any;
 
-    if (bindings.length < PAGE_SIZE) break;
+    if (bindingCount < PAGE_SIZE) break;
     offset += PAGE_SIZE;
     await delay(3000);
   }
 
-  return allNew;
+  return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,10 +247,11 @@ LIMIT ${PAGE_SIZE} OFFSET ${offset}`,
 async function fetchRoleQuery(
   rq: RoleQuery,
   cutoff: string,
-  seen: Map<string, SanctionEntity>
-): Promise<SanctionEntity[]> {
+  seen: Set<string>,
+  onEntity: (e: SanctionEntity) => void,
+): Promise<number> {
   let offset = 0;
-  const allNew: SanctionEntity[] = [];
+  let count = 0;
 
   while (true) {
     const sparql = rq.sparql(offset, cutoff);
@@ -262,111 +261,106 @@ async function fetchRoleQuery(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  Warning: ${rq.label} failed at offset ${offset}: ${msg}`);
-      break;
+      break; // skip on failure, don't retry
     }
 
-    const newOnes = processBindings(bindings, "", seen);
-    allNew.push(...newOnes);
+    const bindingCount = bindings.length;
+    for (const b of bindings) {
+      if (processBinding(b, "", seen, onEntity)) {
+        count++;
+      }
+    }
+    bindings = null as any;
 
-    if (bindings.length < PAGE_SIZE) break;
+    if (bindingCount < PAGE_SIZE) break;
     offset += PAGE_SIZE;
     await delay(3000);
   }
 
-  return allNew;
+  return count;
 }
 
 // ---------------------------------------------------------------------------
-// Main PEP ingestion — inserts into SQLite per country, memory-safe
+// Main PEP ingestion — one country at a time, immediate insert, strict limits.
+// Accepts optional targetDb for daily refresh (inserts into new db file).
 // ---------------------------------------------------------------------------
 
-export async function ingestPep(): Promise<number> {
+export async function ingestPep(targetDb?: Database.Database): Promise<number> {
   console.log("\n=== PEP (Politically Exposed Persons) Ingestion ===\n");
   console.log("Source: Wikidata SPARQL endpoint (CC0 license)");
-
-  // Check memory before starting
-  const startHeap = getHeapMB();
-  if (startHeap > HEAP_SKIP_MB) {
-    console.warn(`[pep] Heap at ${startHeap.toFixed(0)}MB > ${HEAP_SKIP_MB}MB — skipping PEP ingestion entirely`);
-    return 0;
-  }
 
   const cutoff = cutoffDate();
   console.log(`Cutoff date: ${cutoff} (20 years)\n`);
 
-  const batch = getInsertBatch();
-  // Track seen IDs for dedup across countries
-  const seenIds = new Map<string, SanctionEntity>();
+  const batch = getInsertBatch(targetDb);
+  // Set<string> for dedup — stores only wikidataId strings, not full entities
+  const seen = new Set<string>();
+  let total = 0;
 
-  // Phase 1: Politicians by country
+  // Phase 1: Politicians by country (G20 scope)
   console.log("Phase 1: Politicians by country (G20 scope)...");
-  let countryIdx = 0;
 
-  for (const country of G20_COUNTRIES) {
-    countryIdx++;
+  for (let i = 0; i < G20_COUNTRIES.length; i++) {
+    const country = G20_COUNTRIES[i];
 
-    // Check heap before each country
+    // Check heap before each country — stop if > 250MB
     const heapMB = getHeapMB();
-    if (heapMB > HEAP_LIMIT_MB) {
-      console.warn(`[pep] Heap at ${heapMB.toFixed(0)}MB > ${HEAP_LIMIT_MB}MB — skipping remaining PEP countries`);
+    if (heapMB > HEAP_STOP_MB) {
+      console.warn(`[pep] Heap at ${heapMB.toFixed(0)}MB > ${HEAP_STOP_MB}MB — stopping PEP ingestion, marking as ready`);
       break;
     }
 
     try {
-      const entities = await fetchPoliticiansByCountry(
+      const count = await fetchPoliticiansByCountry(
         country.id,
         country.label,
-        cutoff
+        cutoff,
+        seen,
+        (e) => batch.add(e),
       );
-
-      // Insert into SQLite immediately
-      for (const e of entities) {
-        batch.add(e);
-      }
-
-      if (entities.length > 0) {
-        console.log(
-          `  [${countryIdx}/${G20_COUNTRIES.length}] ${country.label}: ${entities.length} politicians`
-        );
+      total += count;
+      if (count > 0) {
+        console.log(`  [${i + 1}/${G20_COUNTRIES.length}] ${country.label}: ${count} politicians`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`  [${countryIdx}/${G20_COUNTRIES.length}] ${country.label}: SKIPPED (${msg})`);
+      console.warn(`  [${i + 1}/${G20_COUNTRIES.length}] ${country.label}: SKIPPED (${msg})`);
+      // Skip, don't retry, continue with next
     }
 
+    // Flush batch and GC after each country
+    batch.flush();
     tryGc();
     await delay(1500);
   }
 
-  batch.flush();
   logHeap("after PEP phase 1");
 
   // Phase 2: Role-specific queries
   console.log("\nPhase 2: Role-specific queries...");
   for (const rq of ROLE_QUERIES) {
     const heapMB = getHeapMB();
-    if (heapMB > HEAP_LIMIT_MB) {
+    if (heapMB > HEAP_STOP_MB) {
       console.warn(`[pep] Heap at ${heapMB.toFixed(0)}MB — skipping remaining role queries`);
       break;
     }
 
     console.log(`  Fetching ${rq.label}...`);
     try {
-      const entities = await fetchRoleQuery(rq, cutoff, seenIds);
-      for (const e of entities) {
-        batch.add(e);
-      }
-      console.log(`  ${rq.label}: ${entities.length} persons`);
+      const count = await fetchRoleQuery(rq, cutoff, seen, (e) => batch.add(e));
+      total += count;
+      console.log(`  ${rq.label}: ${count} persons`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  Failed: ${rq.label}: ${msg}`);
     }
+    batch.flush();
     tryGc();
     await delay(2000);
   }
 
-  const total = batch.flush();
-  seenIds.clear();
+  batch.flush();
+  seen.clear();
   logHeap("after PEP complete");
 
   console.log(`\nPEP ingestion complete: ${total} persons inserted`);

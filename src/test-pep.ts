@@ -1,4 +1,4 @@
-import { initDatabase, insertEntities, getDb } from "./db.js";
+import { initDatabase, getInsertBatch, getDb } from "./db.js";
 import { screenEntity } from "./match.js";
 
 // Quick test: ingest PEP data for just 3 countries + role queries, then screen
@@ -99,7 +99,9 @@ async function main() {
     const entities = await fetchCountry(c.qid, c.label, cutoff);
     console.log(`  ${entities.length} politicians in ${Date.now() - start}ms`);
     if (entities.length > 0) {
-      insertEntities(entities);
+      const batch = getInsertBatch();
+      for (const e of entities) batch.add(e);
+      batch.flush();
       totalPep += entities.length;
     }
     await new Promise(r => setTimeout(r, 3000));
@@ -140,7 +142,7 @@ LIMIT 10000`);
     });
   }
   console.log(`  ${judgeEntities.length} judges`);
-  if (judgeEntities.length > 0) { insertEntities(judgeEntities); totalPep += judgeEntities.length; }
+  if (judgeEntities.length > 0) { const b1 = getInsertBatch(); for (const e of judgeEntities) b1.add(e); b1.flush(); totalPep += judgeEntities.length; }
 
   await new Promise(r => setTimeout(r, 3000));
 
@@ -175,7 +177,7 @@ LIMIT 10000`);
     });
   }
   console.log(`  ${cbgEntities.length} central bank governors`);
-  if (cbgEntities.length > 0) { insertEntities(cbgEntities); totalPep += cbgEntities.length; }
+  if (cbgEntities.length > 0) { const b2 = getInsertBatch(); for (const e of cbgEntities) b2.add(e); b2.flush(); totalPep += cbgEntities.length; }
 
   const db = getDb();
   const pepCount = (db.prepare("SELECT COUNT(*) as count FROM entities WHERE source = 'PEP'").get() as any).count;

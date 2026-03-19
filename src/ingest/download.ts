@@ -1,4 +1,4 @@
-import { mkdirSync, createWriteStream, unlinkSync, existsSync } from "node:fs";
+import { mkdirSync, createWriteStream, unlinkSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sources, type DataSource } from "./sources.js";
 
@@ -80,7 +80,10 @@ async function downloadWithRetry(source: DataSource): Promise<string> {
 export function deleteFile(filepath: string): void {
   try {
     if (existsSync(filepath)) {
+      const size = statSync(filepath).size;
       unlinkSync(filepath);
+      const sizeMB = (size / 1024 / 1024).toFixed(1);
+      console.log(`  Deleted ${filepath} (${sizeMB}MB freed)`);
     }
   } catch {
     // Best effort

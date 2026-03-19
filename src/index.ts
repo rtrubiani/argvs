@@ -139,7 +139,7 @@ app.get("/api/status", (c) => {
       totalEntities: progress.totalEntities,
       errors: progress.errors,
       heap_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-      matching_method: "FTS5 + Levenshtein + token overlap",
+      matching_method: "LIKE + Levenshtein + token overlap",
       update_frequency: "daily",
     });
   }
@@ -172,7 +172,7 @@ app.get("/api/status", (c) => {
     lists,
     total_entities: total.count,
     heap_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-    matching_method: "FTS5 + Levenshtein + token overlap",
+    matching_method: "LIKE + Levenshtein + token overlap",
     update_frequency: "daily",
   });
 });
@@ -303,6 +303,7 @@ cron.schedule("0 6 * * *", () => {
 // Startup
 // ---------------------------------------------------------------------------
 initDatabase();
+console.log(`[heap] startup: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
 
 if (TESTNET) console.log("⚠ TESTNET mode: payments disabled");
 

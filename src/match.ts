@@ -107,15 +107,6 @@ function jaccard(a: string[], b: string[]): number {
 }
 
 // ---------------------------------------------------------------------------
-// Build FTS5 query from tokens
-// ---------------------------------------------------------------------------
-function buildFtsQuery(tokens: string[]): string {
-  if (tokens.length === 0) return "";
-  // Use OR to broaden matches, with prefix matching via *
-  return tokens.map((t) => `"${t}"*`).join(" OR ");
-}
-
-// ---------------------------------------------------------------------------
 // Compute name similarity (order-insensitive, handles extra tokens)
 // ---------------------------------------------------------------------------
 function nameSimilarity(queryNorm: string, queryTokens: string[], candNorm: string, candTokens: string[]): number {
@@ -230,13 +221,12 @@ function scoreCandidate(
 export function screenEntity(query: ScreenQuery): ScreenResponse {
   const queryNorm = normalize(query.name);
   const queryTokens = tokenize(query.name);
-  const ftsQuery = buildFtsQuery(queryTokens);
 
   const totalEntities = getDb()
     .prepare("SELECT COUNT(*) as count FROM entities")
     .get() as { count: number };
 
-  if (!ftsQuery) {
+  if (queryTokens.length === 0) {
     return {
       query: query.name,
       screened_at: new Date().toISOString(),
@@ -249,14 +239,8 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
     };
   }
 
-  // Get initial candidates via FTS5 (top 30 by BM25)
-  let candidates: SearchResult[];
-  try {
-    candidates = searchEntities(ftsQuery, config.ftsCandidateLimit);
-  } catch {
-    // FTS5 query syntax can fail on unusual inputs — fall back empty
-    candidates = [];
-  }
+  // Get initial candidates via LIKE search on search_text (top 30)
+  const candidates = searchEntities(queryTokens, config.ftsCandidateLimit);
 
   // Score and filter
   const scored = candidates

@@ -11,15 +11,16 @@
 
 import { sources } from "./sources.js";
 import { downloadSource, deleteSourceFiles } from "./download.js";
-import { streamParseSource, tryGc, logHeap } from "./parse.js";
+import { streamParseSource, tryGc, logHeap, getHeapMB } from "./parse.js";
 import { ingestPep } from "./pep.js";
 import {
   resetDatabase,
   getInsertBatch,
-  rebuildFtsIndex,
-  createTempEntitiesTable,
-  getInsertBatchForTable,
-  swapTempTable,
+  setRuntimePragmas,
+  shrinkMemory,
+  createRefreshDb,
+  swapRefreshDb,
+  abortRefresh,
   getDb,
 } from "../db.js";
 
@@ -44,12 +45,23 @@ export const progress: IngestionProgress = {
   errors: [],
 };
 
+const HEAP_CRITICAL_MB = 350;
+const HEAP_PEP_SKIP_MB = 200;
+
+function checkHeapCritical(label: string): void {
+  const mb = getHeapMB();
+  if (mb > HEAP_CRITICAL_MB) {
+    console.error(`[CRITICAL] Heap at ${mb.toFixed(0)}MB exceeds ${HEAP_CRITICAL_MB}MB limit — ${label}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Initial ingestion: download → stream-parse → insert → delete, one at a time
 // ---------------------------------------------------------------------------
 
 export async function runInitialIngestion(): Promise<void> {
   console.log("=== Argvs Sanctions Data Ingestion (Streaming) ===\n");
+  logHeap("server startup");
 
   resetDatabase();
   progress.state = "downloading";
@@ -64,6 +76,7 @@ export async function runInitialIngestion(): Promise<void> {
     progress.currentSource = source.name;
     progress.state = "downloading";
     console.log(`\n--- ${source.name} ---`);
+    logHeap(`before downloading ${source.name}`);
 
     // 1. Download to disk
     const result = await downloadSource(source);
@@ -96,11 +109,13 @@ export async function runInitialIngestion(): Promise<void> {
     // 4. Force GC and log heap
     tryGc();
     logHeap(`after ${source.name}`);
+    checkHeapCritical(`after ${source.name}`);
   }
 
-  // 5. Build FTS5 index once at the end
-  console.log("\nBuilding FTS5 search index...");
-  rebuildFtsIndex();
+  // Switch from fast ingestion pragmas to safe runtime pragmas
+  setRuntimePragmas();
+  shrinkMemory();
+  tryGc();
 
   progress.currentSource = null;
   progress.sanctionsReady = true;
@@ -117,16 +132,20 @@ export async function runPepIngestion(): Promise<void> {
   progress.state = "loading_peps";
   progress.currentSource = "PEP (Wikidata)";
 
+  // Check heap before starting PEPs — skip if > 200MB
+  const heapMB = getHeapMB();
+  logHeap("before PEP ingestion");
+  if (heapMB > HEAP_PEP_SKIP_MB) {
+    console.warn(`[pep] Heap at ${heapMB.toFixed(0)}MB > ${HEAP_PEP_SKIP_MB}MB — skipping PEP ingestion`);
+    progress.currentSource = null;
+    progress.state = "ready";
+    return;
+  }
+
   try {
     const pepCount = await ingestPep();
     progress.pepCount = pepCount;
     progress.totalEntities += pepCount;
-
-    // Rebuild FTS to include PEP entries
-    if (pepCount > 0) {
-      rebuildFtsIndex();
-    }
-
     console.log(`\n✓ PEP ingestion complete: ${pepCount} persons`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -134,21 +153,24 @@ export async function runPepIngestion(): Promise<void> {
     progress.errors.push(`PEP: ${msg}`);
   }
 
+  shrinkMemory();
+  tryGc();
   progress.currentSource = null;
   progress.state = "ready";
   logHeap("after PEP ingestion");
 }
 
 // ---------------------------------------------------------------------------
-// Daily refresh: uses temp table strategy for atomic swap
+// Daily refresh: safe swap using separate database file.
+// Creates sanctions_new.db, runs full ingestion into it, then swaps.
+// If anything fails, the working database is untouched.
 // ---------------------------------------------------------------------------
 
 export async function runDailyRefresh(): Promise<void> {
   console.log("[cron] Starting daily sanctions + PEP data refresh...");
+  logHeap("[cron] refresh start");
 
-  // Create temp table for new data
-  createTempEntitiesTable();
-
+  const refreshDb = createRefreshDb();
   let totalEntities = 0;
   let anySourceSucceeded = false;
 
@@ -156,6 +178,7 @@ export async function runDailyRefresh(): Promise<void> {
     progress.currentSource = source.name;
     progress.state = "downloading";
     console.log(`\n[cron] --- ${source.name} ---`);
+    logHeap(`[cron] before downloading ${source.name}`);
 
     const result = await downloadSource(source);
     if (!result.filepath) {
@@ -165,7 +188,7 @@ export async function runDailyRefresh(): Promise<void> {
 
     progress.state = "parsing";
     try {
-      const batch = getInsertBatchForTable("entities_new");
+      const batch = getInsertBatch(refreshDb);
       await streamParseSource(source, result.filepath, (entity) => {
         batch.add(entity);
       });
@@ -181,21 +204,41 @@ export async function runDailyRefresh(): Promise<void> {
     deleteSourceFiles(source);
     tryGc();
     logHeap(`[cron] after ${source.name}`);
+    checkHeapCritical(`[cron] after ${source.name}`);
   }
 
   if (!anySourceSucceeded) {
     console.error("[cron] No sources loaded. Keeping existing data.");
-    getDb().exec("DROP TABLE IF EXISTS entities_new");
+    abortRefresh(refreshDb);
     return;
   }
 
-  // Atomic swap: rename entities_new → entities, rebuild FTS
-  console.log("[cron] Swapping tables...");
-  swapTempTable();
+  // PEP refresh into the new database (non-fatal)
+  try {
+    const heapMB = getHeapMB();
+    if (heapMB <= HEAP_PEP_SKIP_MB) {
+      progress.state = "loading_peps";
+      progress.currentSource = "PEP (Wikidata)";
+      const pepCount = await ingestPep(refreshDb);
+      totalEntities += pepCount;
+      progress.pepCount = pepCount;
+      console.log(`[cron] PEP refresh: ${pepCount} persons`);
+    } else {
+      console.warn(`[cron] Heap at ${heapMB.toFixed(0)}MB — skipping PEP refresh`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[cron] PEP refresh failed (non-fatal): ${msg}`);
+  }
+
+  // Atomic swap: new database file → production
+  console.log("[cron] Swapping database...");
+  swapRefreshDb(refreshDb);
+
   progress.totalEntities = totalEntities;
   progress.sourcesLoaded = {};
 
-  // Count per source in new table
+  // Count per source in new database
   const rows = getDb()
     .prepare("SELECT source, COUNT(*) as cnt FROM entities GROUP BY source")
     .all() as Array<{ source: string; cnt: number }>;
@@ -205,25 +248,9 @@ export async function runDailyRefresh(): Promise<void> {
 
   progress.sanctionsReady = true;
   progress.state = "ready";
-  console.log(`[cron] Sanctions refreshed: ${totalEntities} entities.`);
-  logHeap("[cron] sanctions refresh complete");
-
-  // PEP refresh (non-fatal)
-  try {
-    progress.state = "loading_peps";
-    progress.currentSource = "PEP (Wikidata)";
-    const pepCount = await ingestPep();
-    progress.pepCount = pepCount;
-    progress.totalEntities += pepCount;
-    if (pepCount > 0) rebuildFtsIndex();
-    console.log(`[cron] PEP refresh: ${pepCount} persons`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cron] PEP refresh failed (non-fatal): ${msg}`);
-  }
-
-  progress.currentSource = null;
-  progress.state = "ready";
+  shrinkMemory();
+  tryGc();
+  console.log(`[cron] Refresh complete: ${totalEntities} entities.`);
   logHeap("[cron] full refresh complete");
 }
 

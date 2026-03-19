@@ -19,5 +19,5 @@ RUN npm prune --omit=dev
 EXPOSE 3000
 
 # --expose-gc enables global.gc() for manual garbage collection between sources
-# --max-old-space-size=400 caps V8 heap to stay within Railway's 512MB limit
-CMD ["node", "--expose-gc", "--max-old-space-size=400", "dist/index.js"]
+# --max-old-space-size=450 caps V8 heap to stay within Railway's 512MB limit
+CMD ["node", "--expose-gc", "--max-old-space-size=450", "dist/index.js"]

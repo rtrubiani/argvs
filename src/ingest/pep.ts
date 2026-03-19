@@ -91,8 +91,10 @@ function processBinding(
 
   const position = b.positionLabel?.value ?? "";
   const country = b.countryLabel?.value ?? countryName;
-  const startDate = b.startDate?.value?.slice(0, 10) ?? "";
-  const endDate = b.endDate?.value?.slice(0, 10) ?? "";
+  const rawStart = b.startDate?.value?.slice(0, 10) ?? "";
+  const startDate = /^\d{4}-/.test(rawStart) ? rawStart : "";
+  const rawEnd = b.endDate?.value?.slice(0, 10) ?? "";
+  const endDate = /^\d{4}-/.test(rawEnd) ? rawEnd : "";
 
   onEntity({
     id: `pep:${wikidataId}`,

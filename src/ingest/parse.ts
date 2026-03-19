@@ -412,7 +412,7 @@ async function streamEuXml(
 
       if (tag === "sanctionentity") {
         inEntity = true;
-        entityRefNum = (node.attributes.eureferenceNumber as string) ?? "";
+        entityRefNum = (node.attributes.eureferencenumber as string) ?? "";
         entityDesignationDate = (node.attributes.designationdate as string) ?? "";
         entityRemark = "";
         entitySubjectTypeCode = "";

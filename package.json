@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.11",
+    "@x402/core": "^2.7.0",
+    "@x402/evm": "^2.7.0",
     "better-sqlite3": "^12.8.0",
     "fast-xml-parser": "^5.5.6",
     "hono": "^4.12.8",

@@ -8,6 +8,15 @@ import { initDatabase, getDb } from "./db.js";
 import { screenEntity, batchScreen } from "./match.js";
 import { downloadAllSources } from "./ingest/download.js";
 import { parseSource } from "./ingest/parse.js";
+import {
+  initX402,
+  x402Charge,
+  x402BatchCharge,
+  X402_NETWORK,
+  X402_WALLET,
+  X402_FACILITATOR,
+} from "./x402.js";
+import { notifyScreen, notifyBatch } from "./telegram.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -81,7 +90,24 @@ app.get("/api", (c) =>
         description: "Service discovery and documentation",
       },
     ],
-    payment: ["MPP/Tempo (pathUSD/USDC)"],
+    payment: ["MPP/Tempo (pathUSD)", "x402/Base (USDC)"],
+    paymentMethods: [
+      {
+        protocol: "MPP/Tempo",
+        network: "Tempo",
+        currency: "pathUSD",
+        wallet: WALLET,
+      },
+      {
+        protocol: "x402",
+        network: `Base (${X402_NETWORK})`,
+        currency: "USDC",
+        wallet: X402_WALLET,
+        facilitator: X402_FACILITATOR,
+        scheme: "exact",
+      },
+    ],
+    ...(TESTNET && { testnet: true }),
     sources: [
       "OFAC SDN",
       "OFAC Consolidated",
@@ -136,10 +162,14 @@ app.get("/.well-known/mcp.json", async (c) => {
 
 app.post(
   "/api/screen",
-  (TESTNET ? noopCharge : mppx.charge)({
-    amount: "0.03",
-    description: "Argvs: single sanctions screen",
-  }),
+  x402Charge({ amount: "0.03", description: "Argvs: single sanctions screen" }),
+  async (c, next) => {
+    if (c.get("paymentHandled" as never)) return next();
+    return (TESTNET ? noopCharge : mppx.charge)({
+      amount: "0.03",
+      description: "Argvs: single sanctions screen",
+    })(c, next);
+  },
   async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body?.name || typeof body.name !== "string") {
@@ -150,13 +180,24 @@ app.post(
       type: body.type,
       country: body.country,
     });
+    const payment = (c.get("paymentMethod" as never) as string) ?? "MPP";
+    notifyScreen({
+      query: body.name,
+      riskLevel: result.risk_level,
+      confidence: result.matches?.[0]?.confidence ?? 0,
+      endpoint: "/api/screen",
+      payment,
+    });
     return c.json(result);
   }
 );
 
 app.post(
   "/api/batch",
+  x402BatchCharge(),
   async (c, next) => {
+    // If x402 already handled payment, skip MPP
+    if (c.get("paymentHandled" as never)) return next();
     // Dynamic pricing: peek at entity count to set the amount
     const body = await c.req.json().catch(() => null);
     if (!body?.entities || !Array.isArray(body.entities)) {
@@ -193,6 +234,15 @@ app.post(
       entities: Array<{ name: string; type?: string; country?: string }>;
     };
     const results = batchScreen(body.entities);
+    const payment = (c.get("paymentMethod" as never) as string) ?? "MPP";
+    const flagged = Array.isArray(results)
+      ? results.filter((r: any) => r.risk_level !== "clear").length
+      : 0;
+    notifyBatch({
+      entityCount: body.entities.length,
+      flaggedCount: flagged,
+      payment,
+    });
     return c.json(results);
   }
 );
@@ -245,6 +295,10 @@ const totalEntities = (
 
 console.log(`Loaded ${totalEntities} entities`);
 if (TESTNET) console.log("⚠ TESTNET mode: payments disabled");
+
+// Initialize x402 (async, non-blocking — server starts immediately)
+initX402().catch(() => {});
+
 console.log(`Argvs running on port ${PORT}`);
 
 serve({ fetch: app.fetch, port: PORT });

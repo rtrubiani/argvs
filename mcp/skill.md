@@ -6,7 +6,9 @@ Argvs screens names against international sanctions lists (OFAC SDN, OFAC Consol
 
 Base URL: `http://localhost:3000`
 
-Payment: MPP/Tempo — pathUSD stablecoins on Tempo blockchain.
+Payment: Two options available:
+- **MPP/Tempo** — pathUSD stablecoins on Tempo blockchain
+- **x402/Base** — USDC on Base via the x402 payment protocol (facilitator: `https://facilitator.x402.org`)
 
 ## Endpoints
 
@@ -38,9 +40,9 @@ curl http://localhost:3000/api/status
 curl http://localhost:3000/api
 ```
 
-## Using with mppx CLI
+## Payment Methods
 
-Agents can pay for screens using the mppx CLI:
+### Option 1: MPP/Tempo (mppx CLI)
 
 ```bash
 # Install mppx
@@ -56,6 +58,10 @@ mppx fetch POST http://localhost:3000/api/batch \
   --body '{"entities": [{"name": "Kim Jong Un"}, {"name": "Al-Rashid Trust"}]}' \
   --method tempo
 ```
+
+### Option 2: x402/Base (USDC)
+
+Agents supporting the x402 payment protocol can pay with USDC on Base. The server returns HTTP 402 with payment requirements; the agent signs a USDC transfer authorization and re-sends with an `X-PAYMENT` header. Settlement is handled by the public facilitator at `https://facilitator.x402.org`.
 
 ## MCP Tool Discovery
 

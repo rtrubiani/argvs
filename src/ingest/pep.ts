@@ -49,7 +49,7 @@ async function runSparqlQuery(sparql: string): Promise<SparqlBinding[]> {
       Accept: "application/sparql-results+json",
       "User-Agent": USER_AGENT,
     },
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(5_000),
   });
 
   if (!resp.ok) {
@@ -141,26 +141,31 @@ function mergeInto(
 }
 
 // ---------------------------------------------------------------------------
-// Fetch sovereign states list
+// G20 countries (reduced scope for reliability)
 // ---------------------------------------------------------------------------
 
-async function fetchCountries(): Promise<
-  Array<{ id: string; label: string }>
-> {
-  const bindings = await runSparqlQuery(`
-    SELECT ?country ?countryLabel WHERE {
-      ?country wdt:P31 wd:Q6256 .
-      ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel) = "en")
-    }
-  `);
-
-  return bindings
-    .map((b) => ({
-      id: b.country?.value?.replace("http://www.wikidata.org/entity/", "") ?? "",
-      label: b.countryLabel?.value ?? "",
-    }))
-    .filter((c) => c.id && c.label);
-}
+const G20_COUNTRIES: Array<{ id: string; label: string }> = [
+  { id: "Q30", label: "United States" },
+  { id: "Q145", label: "United Kingdom" },
+  { id: "Q142", label: "France" },
+  { id: "Q183", label: "Germany" },
+  { id: "Q38", label: "Italy" },
+  { id: "Q17", label: "Japan" },
+  { id: "Q16", label: "Canada" },
+  { id: "Q408", label: "Australia" },
+  { id: "Q155", label: "Brazil" },
+  { id: "Q414", label: "Argentina" },
+  { id: "Q96", label: "Mexico" },
+  { id: "Q884", label: "South Korea" },
+  { id: "Q668", label: "India" },
+  { id: "Q148", label: "China" },
+  { id: "Q159", label: "Russia" },
+  { id: "Q258", label: "South Africa" },
+  { id: "Q851", label: "Saudi Arabia" },
+  { id: "Q43", label: "Turkey" },
+  { id: "Q252", label: "Indonesia" },
+  { id: "Q458", label: "European Union" },
+];
 
 // ---------------------------------------------------------------------------
 // Per-country politician query with pagination
@@ -302,17 +307,10 @@ export async function ingestPep(): Promise<SanctionEntity[]> {
 
   const allEntities = new Map<string, SanctionEntity>();
 
-  // Phase 1: Fetch politicians per country
-  console.log("Phase 1: Politicians by country...");
-  let countries: Array<{ id: string; label: string }>;
-  try {
-    countries = await fetchCountries();
-    console.log(`  ${countries.length} sovereign states found`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`  Failed to fetch country list: ${msg}`);
-    countries = [];
-  }
+  // Phase 1: Fetch politicians for G20 countries
+  console.log("Phase 1: Politicians by country (G20 scope)...");
+  const countries = G20_COUNTRIES;
+  console.log(`  ${countries.length} G20 countries`);
 
   let countryIdx = 0;
   for (const country of countries) {

@@ -310,13 +310,18 @@ async function refreshData() {
         );
       }
     }
-    // PEP ingestion
+    // Mark ready with sanctions data before attempting PEP ingestion
+    dataReady = true;
+    console.log(`[cron] Sanctions loaded. ${total} entities indexed. Server ready.`);
+
+    // PEP ingestion (non-fatal — server stays up with sanctions-only if this fails)
     try {
       const { ingestPep } = await import("./ingest/pep.js");
       const pepEntities = await ingestPep();
       if (pepEntities.length > 0) {
         insertEntities(pepEntities);
         total += pepEntities.length;
+        console.log(`[cron] PEP ingestion added ${pepEntities.length} entities. Total: ${total}`);
       }
     } catch (err) {
       console.error(
@@ -324,8 +329,6 @@ async function refreshData() {
         err instanceof Error ? err.message : err
       );
     }
-    dataReady = true;
-    console.log(`[cron] Refresh complete. ${total} entities indexed.`);
   } catch (err) {
     console.error("[cron] Refresh failed:", err);
   }

@@ -1,6 +1,6 @@
-# Argvs — Sanctions Screening API
+# Argvs — Sanctions & PEP Screening API
 
-Argvs screens names against international sanctions lists (OFAC SDN, OFAC Consolidated, EU, UN, UK HMT) using fuzzy matching. Results include confidence scores, risk levels, and matched list details.
+Argvs screens names against international sanctions lists (OFAC SDN, OFAC Consolidated, EU, UN, UK HMT) and Politically Exposed Persons (PEP) data sourced from Wikidata (CC0 license). Results include confidence scores, risk levels, PEP status, and matched list details.
 
 ## Quick Start
 
@@ -85,14 +85,26 @@ Argvs serves `/.well-known/mcp.json` for automatic tool discovery by AI agents (
     }
   ],
   "risk_level": "match",
-  "lists_checked": ["ofac_sdn", "ofac_consolidated", "eu", "un", "uk_hmt"],
+  "pep_status": false,
+  "lists_checked": ["ofac_sdn", "ofac_consolidated", "eu", "un", "uk_hmt", "PEP"],
   "total_entities_screened": 31145,
   "disclaimer": "Automated screening tool. Results should be verified against official sources. Not legal or compliance advice."
 }
 ```
 
+## PEP Screening
+
+PEP (Politically Exposed Persons) data is sourced from Wikidata's SPARQL endpoint (CC0 license, no commercial restrictions). The database includes:
+- Heads of state and government
+- Members of parliament/congress/senate
+- Cabinet ministers
+- Supreme/constitutional court judges
+- Central bank governors
+
+PEP matches include a `position` field showing the political office held. The `pep_status` field in the response is `true` when any PEP match is found above 70% confidence. PEP screening is included in the existing pricing — no additional cost.
+
 ## Risk Levels
 
 - **match** (confidence >= 90): Strong match found. Verify against official sources.
-- **potential_match** (confidence 70-89): Possible match. Manual review recommended.
-- **clear** (confidence < 70): No significant matches found.
+- **potential_match** (confidence 70-89): Possible match. Manual review recommended. Also set if PEP match found above 70%.
+- **clear** (confidence < 70): No significant matches found (and no PEP matches above 70%).

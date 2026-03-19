@@ -1,11 +1,11 @@
 {
   "name": "Argvs",
-  "description": "Instant sanctions screening API for AI agents. Screens names against OFAC SDN, OFAC Consolidated, EU, UN, and UK HMT sanctions lists using fuzzy matching.",
+  "description": "Instant sanctions and PEP screening API for AI agents. Screens names against OFAC SDN, OFAC Consolidated, EU, UN, and UK HMT sanctions lists plus Politically Exposed Persons (PEP) data from Wikidata using fuzzy matching.",
   "url": "http://localhost:3000",
   "tools": [
     {
       "name": "screen_sanctions",
-      "description": "Screen a single name against all international sanctions lists (OFAC, EU, UN, UK). Returns match confidence, risk level, and matched list details. Costs $0.03 per screen via MPP/Tempo or x402/Base.",
+      "description": "Screen a single name against all international sanctions lists (OFAC, EU, UN, UK) and Politically Exposed Persons (PEP) database. Returns match confidence, risk level, PEP status, and matched list details. Costs $0.03 per screen via MPP/Tempo or x402/Base.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -48,7 +48,7 @@
     },
     {
       "name": "batch_screen_sanctions",
-      "description": "Screen multiple names against all international sanctions lists in a single request. Max 100 entities. Costs $0.02 per entity via MPP/Tempo or x402/Base.",
+      "description": "Screen multiple names against all international sanctions lists and PEP database in a single request. Max 100 entities. Costs $0.02 per entity via MPP/Tempo or x402/Base.",
       "inputSchema": {
         "type": "object",
         "properties": {

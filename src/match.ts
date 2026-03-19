@@ -24,6 +24,7 @@ export interface MatchResult {
   countries: string[];
   confidence: number;
   aliases_matched: string[];
+  position?: string;
 }
 
 export interface ScreenResponse {
@@ -31,6 +32,7 @@ export interface ScreenResponse {
   screened_at: string;
   matches: MatchResult[];
   risk_level: "clear" | "potential_match" | "match";
+  pep_status: boolean;
   lists_checked: string[];
   total_entities_screened: number;
   disclaimer: string;
@@ -45,6 +47,7 @@ const LISTS_CHECKED = [
   "eu",
   "un",
   "uk_hmt",
+  "PEP",
 ];
 
 // ---------------------------------------------------------------------------
@@ -239,6 +242,7 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
       screened_at: new Date().toISOString(),
       matches: [],
       risk_level: "clear",
+      pep_status: false,
       lists_checked: LISTS_CHECKED,
       total_entities_screened: totalEntities.count,
       disclaimer: DISCLAIMER,
@@ -263,7 +267,7 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
         queryTokens,
         c
       );
-      return {
+      const result: MatchResult = {
         name: c.name,
         source: c.source,
         type: c.type,
@@ -272,10 +276,20 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
         confidence,
         aliases_matched,
       };
+      // Include position for PEP matches (stored in remarks)
+      if (c.source === "PEP" && c.remarks) {
+        result.position = c.remarks;
+      }
+      return result;
     })
     .filter((m) => m.confidence >= config.minConfidence)
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, config.maxResults);
+
+  // Check PEP status: true if any match from PEP source above 70%
+  const pep_status = scored.some(
+    (m) => m.source === "PEP" && m.confidence >= config.potentialMatchThreshold
+  );
 
   // Determine risk level
   let risk_level: ScreenResponse["risk_level"] = "clear";
@@ -285,11 +299,17 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
     else if (topScore >= config.potentialMatchThreshold) risk_level = "potential_match";
   }
 
+  // PEP matches above 70% should never be "clear"
+  if (pep_status && risk_level === "clear") {
+    risk_level = "potential_match";
+  }
+
   return {
     query: query.name,
     screened_at: new Date().toISOString(),
     matches: scored,
     risk_level,
+    pep_status,
     lists_checked: LISTS_CHECKED,
     total_entities_screened: totalEntities.count,
     disclaimer: DISCLAIMER,

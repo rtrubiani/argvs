@@ -62,20 +62,20 @@ app.get("/api", (c) =>
   c.json({
     name: "Argvs",
     description:
-      "Instant sanctions screening for AI agents. Checks OFAC, EU, UN, UK lists.",
+      "Instant sanctions and PEP screening for AI agents. Checks OFAC, EU, UN, UK lists and Politically Exposed Persons (PEP) via Wikidata.",
     version: "1.0.0",
     endpoints: [
       {
         path: "/api/screen",
         method: "POST",
         price: "$0.03",
-        description: "Screen a single name against all sanctions lists",
+        description: "Screen a single name against all sanctions lists and PEP database",
       },
       {
         path: "/api/batch",
         method: "POST",
         price: "$0.02 per entity",
-        description: "Screen multiple names in a single request (max 100)",
+        description: "Screen multiple names against sanctions lists and PEP database (max 100)",
       },
       {
         path: "/api/status",
@@ -114,6 +114,7 @@ app.get("/api", (c) =>
       "EU Consolidated",
       "UN SCSC",
       "UK HMT",
+      "PEP (Wikidata)",
     ],
   })
 );
@@ -251,7 +252,7 @@ app.post(
 // Data refresh (daily at 06:00 UTC)
 // ---------------------------------------------------------------------------
 async function refreshData() {
-  console.log("[cron] Starting daily sanctions data refresh...");
+  console.log("[cron] Starting daily sanctions + PEP data refresh...");
   try {
     const results = await downloadAllSources();
     const succeeded = results.filter((r) => r.filepath !== null);
@@ -273,6 +274,20 @@ async function refreshData() {
           err instanceof Error ? err.message : err
         );
       }
+    }
+    // PEP ingestion
+    try {
+      const { ingestPep } = await import("./ingest/pep.js");
+      const pepEntities = await ingestPep();
+      if (pepEntities.length > 0) {
+        insertEntities(pepEntities);
+        total += pepEntities.length;
+      }
+    } catch (err) {
+      console.error(
+        "[cron] PEP ingestion failed:",
+        err instanceof Error ? err.message : err
+      );
     }
     console.log(`[cron] Refresh complete. ${total} entities indexed.`);
   } catch (err) {

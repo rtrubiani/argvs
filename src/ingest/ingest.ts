@@ -1,5 +1,6 @@
 import { downloadAllSources } from "./download.js";
 import { parseSource } from "./parse.js";
+import { ingestPep } from "./pep.js";
 import { resetDatabase, insertEntities } from "../db.js";
 
 async function main() {
@@ -24,7 +25,7 @@ async function main() {
   // Reset DB for fresh ingestion
   resetDatabase();
 
-  // Parse and insert
+  // Parse and insert sanctions lists
   let totalEntities = 0;
   for (const result of succeeded) {
     console.log(`Parsing ${result.source.name}...`);
@@ -37,6 +38,19 @@ async function main() {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ✗ Failed to parse ${result.source.name}: ${msg}`);
     }
+  }
+
+  // Ingest PEP data from Wikidata
+  try {
+    const pepEntities = await ingestPep();
+    if (pepEntities.length > 0) {
+      insertEntities(pepEntities);
+      totalEntities += pepEntities.length;
+      console.log(`  → ${pepEntities.length} PEP entities inserted`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ✗ Failed PEP ingestion: ${msg}`);
   }
 
   console.log(`\n✓ Done. ${totalEntities} total entities indexed.`);

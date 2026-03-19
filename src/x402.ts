@@ -53,7 +53,14 @@ export async function initX402(): Promise<void> {
     };
 
     httpServer = new x402HTTPResourceServer(resourceServer, routes);
-    await httpServer.initialize();
+
+    // Timeout initialization to prevent hanging on network-restricted environments
+    await Promise.race([
+      httpServer.initialize(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timed out after 10s")), 10_000)
+      ),
+    ]);
     console.log(`x402 payment support initialized (network: ${X402_NETWORK})`);
   } catch (err) {
     console.warn(

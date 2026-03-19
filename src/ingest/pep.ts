@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 
 import type { SanctionEntity } from "./parse.js";
+import { tryGc } from "./parse.js";
 
 const SPARQL_ENDPOINT = "https://query.wikidata.org/sparql";
 const USER_AGENT = "Argvs PEP Screener/1.0.0 (https://github.com/anthropics/argvs; contact: argvs@vigil.dev)";
@@ -330,6 +331,7 @@ export async function ingestPep(): Promise<SanctionEntity[]> {
     } catch {
       // Skip failed countries silently
     }
+    tryGc();
     await delay(1500); // Rate limit between countries
   }
 
@@ -347,6 +349,7 @@ export async function ingestPep(): Promise<SanctionEntity[]> {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  Failed: ${rq.label}: ${msg}`);
     }
+    tryGc();
     await delay(2000);
   }
 

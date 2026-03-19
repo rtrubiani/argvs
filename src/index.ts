@@ -7,7 +7,7 @@ import { Mppx, tempo } from "mppx/hono";
 import { initDatabase, getDb } from "./db.js";
 import { screenEntity, batchScreen } from "./match.js";
 import { downloadAllSources } from "./ingest/download.js";
-import { parseSource } from "./ingest/parse.js";
+import { parseSource, tryGc } from "./ingest/parse.js";
 import {
   initX402,
   x402Charge,
@@ -300,9 +300,11 @@ async function refreshData() {
     let total = 0;
     for (const result of succeeded) {
       try {
-        const entities = parseSource(result.source, result.filepath!);
+        let entities: ReturnType<typeof parseSource> | null = parseSource(result.source, result.filepath!);
         insertEntities(entities);
         total += entities.length;
+        entities = null;
+        tryGc();
       } catch (err) {
         console.error(
           `[cron] Failed to parse ${result.source.name}:`,

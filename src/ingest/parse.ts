@@ -25,6 +25,12 @@ function clean(val: unknown): string {
   return String(val).trim();
 }
 
+export function tryGc(): void {
+  if (typeof globalThis.gc === "function") {
+    globalThis.gc();
+  }
+}
+
 function makeXmlParser(): XMLParser {
   return new XMLParser({
     ignoreAttributes: false,
@@ -34,35 +40,186 @@ function makeXmlParser(): XMLParser {
 }
 
 // ---------------------------------------------------------------------------
-// OFAC Advanced XML (SDN & Consolidated use same schema)
+// OFAC lookup context (shared across batches)
 // ---------------------------------------------------------------------------
+interface OfacLookups {
+  partySubTypes: Map<string, { name: string; partyTypeId: string }>;
+  partyTypes: Map<string, string>;
+  locationCountries: Map<string, string>;
+  profilePrograms: Map<string, string[]>;
+  profileDates: Map<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Process a single parsed DistinctParty object into a SanctionEntity
+// ---------------------------------------------------------------------------
+function processOfacParty(
+  party: any,
+  sourceId: string,
+  ctx: OfacLookups
+): SanctionEntity | null {
+  const profile = party.Profile;
+  if (!profile) return null;
+
+  const profileId = clean(profile["@_ID"]);
+  const partySubTypeId = clean(profile["@_PartySubTypeID"]);
+  const subType = ctx.partySubTypes.get(partySubTypeId);
+  const partyTypeName = subType
+    ? ctx.partyTypes.get(subType.partyTypeId)?.toLowerCase() ?? ""
+    : "";
+
+  let type: SanctionEntity["type"] = "unknown";
+  if (partyTypeName.includes("individual")) type = "individual";
+  else if (partyTypeName.includes("entity")) type = "entity";
+  else if (subType?.name.toLowerCase().includes("vessel")) type = "vessel";
+  else if (subType?.name.toLowerCase().includes("aircraft")) type = "aircraft";
+
+  const identity = toArray(profile.Identity)[0];
+  if (!identity) return null;
+
+  const aliases = toArray(identity.Alias);
+  let primaryName = "";
+  const aliasNames: string[] = [];
+
+  for (const alias of aliases) {
+    const isPrimary = clean(alias["@_Primary"]) === "true";
+    const docNames = toArray(alias.DocumentedName);
+    for (const docName of docNames) {
+      const parts = toArray(docName.DocumentedNamePart);
+      const nameParts = parts.map((p: any) =>
+        clean(
+          Array.isArray(p.NamePartValue)
+            ? p.NamePartValue[0]?.["#text"] ?? p.NamePartValue[0]
+            : p.NamePartValue?.["#text"] ?? p.NamePartValue
+        )
+      );
+      const fullName = nameParts.filter(Boolean).join(" ");
+      if (!fullName) continue;
+
+      if (isPrimary && !primaryName) {
+        primaryName = fullName;
+      } else {
+        aliasNames.push(fullName);
+      }
+    }
+  }
+
+  if (!primaryName) {
+    primaryName = aliasNames.shift() ?? "";
+  }
+  if (!primaryName) return null;
+
+  const countries: string[] = [];
+  for (const feature of toArray(profile.Feature)) {
+    for (const fv of toArray(feature.FeatureVersion)) {
+      const locId = clean(fv.VersionLocation?.["@_LocationID"]);
+      const country = ctx.locationCountries.get(locId);
+      if (country) countries.push(country);
+    }
+  }
+
+  return {
+    id: `${sourceId}:${profileId}`,
+    source: sourceId,
+    name: primaryName,
+    aliases: [...new Set(aliasNames)],
+    type,
+    programs: ctx.profilePrograms.get(profileId) ?? [],
+    countries: [...new Set(countries)],
+    identifiers: [],
+    date_listed: ctx.profileDates.get(profileId) ?? "",
+    remarks: clean(party.Comment),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Parse a batch of DistinctParty XML strings
+// ---------------------------------------------------------------------------
+function processOfacBatch(
+  batch: string[],
+  parser: XMLParser,
+  sourceId: string,
+  ctx: OfacLookups,
+  results: SanctionEntity[]
+): void {
+  const batchXml = `<B>${batch.join("")}</B>`;
+  const doc = parser.parse(batchXml);
+  const parties = toArray(doc?.B?.DistinctParty);
+
+  for (const party of parties) {
+    const entity = processOfacParty(party, sourceId, ctx);
+    if (entity) results.push(entity);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OFAC Advanced XML — chunked parsing to stay within 512MB RAM
+//
+// Instead of parsing the entire 117MB XML at once (which creates a ~400MB JS
+// object), we:
+//   1. Extract and parse only the reference sections (small)
+//   2. Split DistinctParty entries and parse in batches of 200
+//   3. Free intermediate data between steps
+// ---------------------------------------------------------------------------
+const OFAC_BATCH_SIZE = 200;
+
 function parseOfacAdvancedXml(
   filepath: string,
   sourceId: string
 ): SanctionEntity[] {
-  const xml = readFileSync(filepath, "utf-8");
-  const parser = makeXmlParser();
-  const doc = parser.parse(xml);
+  // Step 1: Read full file
+  let raw: string | null = readFileSync(filepath, "utf-8");
+  console.log(
+    `[parse] ${sourceId}: ${(raw.length / 1024 / 1024).toFixed(1)}MB XML`
+  );
 
-  const root = doc?.Sanctions;
+  // Step 2: Locate DistinctParties section
+  const dpStartIdx = raw.indexOf("<DistinctParties");
+  const dpCloseTag = "</DistinctParties>";
+  const dpEndIdx = raw.lastIndexOf(dpCloseTag);
+
+  if (dpStartIdx === -1 || dpEndIdx === -1) {
+    console.warn(`[parse] ${sourceId}: no DistinctParties section found`);
+    return [];
+  }
+
+  // Find end of the opening tag (handles attributes on the element)
+  const dpContentStart = raw.indexOf(">", dpStartIdx) + 1;
+
+  // Step 3: Extract reference XML (everything before DistinctParties)
+  // and party content separately, then free the full raw string
+  const refXml = raw.substring(0, dpStartIdx) + "</Sanctions>";
+  let dpContent: string | null = raw.substring(dpContentStart, dpEndIdx);
+  raw = null;
+  tryGc();
+
+  // Step 4: Parse reference data and build lookup tables
+  const parser = makeXmlParser();
+  let refDoc: any = parser.parse(refXml);
+  const root = refDoc?.Sanctions;
   if (!root) return [];
 
-  // Build reference lookup tables
-  const partySubTypes = new Map<string, { name: string; partyTypeId: string }>();
+  const ctx: OfacLookups = {
+    partySubTypes: new Map(),
+    partyTypes: new Map(),
+    locationCountries: new Map(),
+    profilePrograms: new Map(),
+    profileDates: new Map(),
+  };
+
   for (const pst of toArray(
     root.ReferenceValueSets?.PartySubTypeValues?.PartySubType
   )) {
-    partySubTypes.set(clean(pst["@_ID"]), {
+    ctx.partySubTypes.set(clean(pst["@_ID"]), {
       name: clean(pst["#text"]),
       partyTypeId: clean(pst["@_PartyTypeID"]),
     });
   }
 
-  const partyTypes = new Map<string, string>();
   for (const pt of toArray(
     root.ReferenceValueSets?.PartyTypeValues?.PartyType
   )) {
-    partyTypes.set(clean(pt["@_ID"]), clean(pt["#text"]));
+    ctx.partyTypes.set(clean(pt["@_ID"]), clean(pt["#text"]));
   }
 
   const areaCodeCountries = new Map<string, string>();
@@ -72,21 +229,16 @@ function parseOfacAdvancedXml(
     areaCodeCountries.set(clean(ac["@_ID"]), clean(ac["@_Description"]));
   }
 
-  // Build location -> country lookup
-  const locationCountries = new Map<string, string>();
   for (const loc of toArray(root.Locations?.Location)) {
     const countryId = clean(loc.LocationCountry?.["@_CountryID"]);
     if (countryId && areaCodeCountries.has(countryId)) {
-      locationCountries.set(
+      ctx.locationCountries.set(
         clean(loc["@_ID"]),
         areaCodeCountries.get(countryId)!
       );
     }
   }
 
-  // Build profileId -> programs and date_listed from SanctionsEntries
-  const profilePrograms = new Map<string, string[]>();
-  const profileDates = new Map<string, string>();
   for (const entry of toArray(root.SanctionsEntries?.SanctionsEntry)) {
     const profileId = clean(entry["@_ProfileID"]);
     const programs: string[] = [];
@@ -94,7 +246,7 @@ function parseOfacAdvancedXml(
       const comment = clean(measure.Comment);
       if (comment) programs.push(comment);
     }
-    profilePrograms.set(profileId, programs);
+    ctx.profilePrograms.set(profileId, programs);
 
     const ev = toArray(entry.EntryEvent)[0];
     if (ev) {
@@ -103,93 +255,51 @@ function parseOfacAdvancedXml(
         const y = clean(date.Year);
         const m = clean(date.Month);
         const d = clean(date.Day);
-        if (y) profileDates.set(profileId, `${y}-${m?.padStart(2, "0")}-${d?.padStart(2, "0")}`);
+        if (y)
+          ctx.profileDates.set(
+            profileId,
+            `${y}-${m?.padStart(2, "0")}-${d?.padStart(2, "0")}`
+          );
       }
     }
   }
 
-  // Parse DistinctParty entries
-  const parties = toArray(root.DistinctParties?.DistinctParty);
+  // Free parsed reference doc
+  refDoc = null;
+  tryGc();
+
+  // Step 5: Process DistinctParty entries in batches
   const results: SanctionEntity[] = [];
+  const PARTY_OPEN = "<DistinctParty";
+  const PARTY_CLOSE = "</DistinctParty>";
+  let searchFrom = 0;
+  let batch: string[] = [];
 
-  for (const party of parties) {
-    const profile = party.Profile;
-    if (!profile) continue;
+  while (true) {
+    const start = dpContent!.indexOf(PARTY_OPEN, searchFrom);
+    if (start === -1) break;
+    const closeIdx = dpContent!.indexOf(PARTY_CLOSE, start);
+    if (closeIdx === -1) break;
+    const end = closeIdx + PARTY_CLOSE.length;
 
-    const profileId = clean(profile["@_ID"]);
-    const partySubTypeId = clean(profile["@_PartySubTypeID"]);
-    const subType = partySubTypes.get(partySubTypeId);
-    const partyTypeName = subType
-      ? partyTypes.get(subType.partyTypeId)?.toLowerCase() ?? ""
-      : "";
+    batch.push(dpContent!.substring(start, end));
+    searchFrom = end;
 
-    let type: SanctionEntity["type"] = "unknown";
-    if (partyTypeName.includes("individual")) type = "individual";
-    else if (partyTypeName.includes("entity")) type = "entity";
-    else if (subType?.name.toLowerCase().includes("vessel")) type = "vessel";
-    else if (subType?.name.toLowerCase().includes("aircraft"))
-      type = "aircraft";
-
-    // Extract names from Identity > Alias > DocumentedName > NamePartValue
-    const identity = toArray(profile.Identity)[0];
-    if (!identity) continue;
-
-    const aliases = toArray(identity.Alias);
-    let primaryName = "";
-    const aliasNames: string[] = [];
-
-    for (const alias of aliases) {
-      const isPrimary = clean(alias["@_Primary"]) === "true";
-      const docNames = toArray(alias.DocumentedName);
-      for (const docName of docNames) {
-        const parts = toArray(docName.DocumentedNamePart);
-        const nameParts = parts.map((p: any) =>
-          clean(
-            Array.isArray(p.NamePartValue)
-              ? p.NamePartValue[0]?.["#text"] ?? p.NamePartValue[0]
-              : p.NamePartValue?.["#text"] ?? p.NamePartValue
-          )
-        );
-        const fullName = nameParts.filter(Boolean).join(" ");
-        if (!fullName) continue;
-
-        if (isPrimary && !primaryName) {
-          primaryName = fullName;
-        } else {
-          aliasNames.push(fullName);
-        }
-      }
+    if (batch.length >= OFAC_BATCH_SIZE) {
+      processOfacBatch(batch, parser, sourceId, ctx, results);
+      batch = [];
     }
-
-    if (!primaryName) {
-      primaryName = aliasNames.shift() ?? "";
-    }
-    if (!primaryName) continue;
-
-    // Countries from features referencing locations
-    const countries: string[] = [];
-    for (const feature of toArray(profile.Feature)) {
-      for (const fv of toArray(feature.FeatureVersion)) {
-        const locId = clean(fv.VersionLocation?.["@_LocationID"]);
-        const country = locationCountries.get(locId);
-        if (country) countries.push(country);
-      }
-    }
-
-    results.push({
-      id: `${sourceId}:${profileId}`,
-      source: sourceId,
-      name: primaryName,
-      aliases: [...new Set(aliasNames)],
-      type,
-      programs: profilePrograms.get(profileId) ?? [],
-      countries: [...new Set(countries)],
-      identifiers: [],
-      date_listed: profileDates.get(profileId) ?? "",
-      remarks: clean(party.Comment),
-    });
   }
 
+  if (batch.length > 0) {
+    processOfacBatch(batch, parser, sourceId, ctx, results);
+  }
+
+  // Free party content
+  dpContent = null;
+  tryGc();
+
+  console.log(`[parse] ${sourceId}: ${results.length} entities parsed`);
   return results;
 }
 

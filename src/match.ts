@@ -1,4 +1,11 @@
 import { searchEntities, getDb, type SearchResult } from "./db.js";
+import { config } from "./match-config.js";
+
+// ---------------------------------------------------------------------------
+// Scoring weights and confidence thresholds are in src/match-config.ts.
+// The default values work for general screening, but production deployments
+// use tuned values loaded from environment variables.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Types
@@ -139,7 +146,7 @@ function nameSimilarity(queryNorm: string, queryTokens: string[], candNorm: stri
       if (bestIdx >= 0) {
         const tokenMax = Math.max(qt.length, candTokens[bestIdx].length);
         const tokenSim = tokenMax === 0 ? 1 : 1 - bestDist / tokenMax;
-        if (tokenSim >= 0.6) {
+        if (tokenSim >= config.tokenSimThreshold) {
           matched++;
           used.add(bestIdx);
         }
@@ -182,7 +189,7 @@ function scoreCandidate(
     if (aliasSim > bestAliasSim) {
       bestAliasSim = aliasSim;
     }
-    if (aliasSim >= 0.5) {
+    if (aliasSim >= config.aliasMatchThreshold) {
       aliasesMatched.push(alias);
     }
   }
@@ -190,22 +197,22 @@ function scoreCandidate(
   // Take best of primary name vs best alias
   const bestSim = Math.max(primarySim, bestAliasSim);
 
-  // Base score: 0-90 from name similarity
-  let score = bestSim * 90;
+  // Base score from name similarity
+  let score = bestSim * config.nameWeight;
 
-  // Country boost: +5
+  // Country boost
   if (query.country) {
     const qCountry = normalize(query.country);
     const matches = candidate.countries.some(
       (c) => normalize(c) === qCountry || normalize(c).includes(qCountry)
     );
-    if (matches) score += 5;
+    if (matches) score += config.countryBoost;
   }
 
-  // Type boost: +5
+  // Type boost
   if (query.type) {
     const qType = normalize(query.type);
-    if (normalize(candidate.type) === qType) score += 5;
+    if (normalize(candidate.type) === qType) score += config.typeBoost;
   }
 
   // Clamp to 0-100
@@ -241,7 +248,7 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
   // Get initial candidates via FTS5 (top 30 by BM25)
   let candidates: SearchResult[];
   try {
-    candidates = searchEntities(ftsQuery, 30);
+    candidates = searchEntities(ftsQuery, config.ftsCandidateLimit);
   } catch {
     // FTS5 query syntax can fail on unusual inputs — fall back empty
     candidates = [];
@@ -266,16 +273,16 @@ export function screenEntity(query: ScreenQuery): ScreenResponse {
         aliases_matched,
       };
     })
-    .filter((m) => m.confidence >= 60)
+    .filter((m) => m.confidence >= config.minConfidence)
     .sort((a, b) => b.confidence - a.confidence)
-    .slice(0, 5);
+    .slice(0, config.maxResults);
 
   // Determine risk level
   let risk_level: ScreenResponse["risk_level"] = "clear";
   if (scored.length > 0) {
     const topScore = scored[0].confidence;
-    if (topScore >= 90) risk_level = "match";
-    else if (topScore >= 70) risk_level = "potential_match";
+    if (topScore >= config.matchThreshold) risk_level = "match";
+    else if (topScore >= config.potentialMatchThreshold) risk_level = "potential_match";
   }
 
   return {
